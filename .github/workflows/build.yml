@@ -50,6 +50,17 @@ jobs:
           arduino-cli lib install "pdulib@${{ env.PDULIB_VERSION }}"
           arduino-cli lib install "ReadyMail@${{ env.READYMAIL_VERSION }}"
 
+      - name: Generate build stamp
+        # 没有这个头文件时固件只能回落到 __DATE__/__TIME__（编译该文件的时刻），
+        # 且看不到 git 版本 —— 发布出去的固件得能自证是哪个提交编的。
+        run: |
+          cat > code/build_stamp.h <<HDR
+          #pragma once
+          #define FW_BUILD "$(date -u '+%Y-%m-%d %H:%M:%S')"
+          #define FW_GITREV "$(git rev-parse --short HEAD)"
+          HDR
+          cat code/build_stamp.h
+
       - name: Compile
         run: |
           arduino-cli compile \
