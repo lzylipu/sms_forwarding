@@ -1,0 +1,10 @@
+# 自定义分区表：4MB Flash，双 APP 槽支持 OTA
+# app0/app1 各 1.75MB（当前固件约 1.4MB，留 350KB 余量）
+# spiffs 384KB 给短信收件箱用（上限 160KB 数据 + 余量）
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+app0,     app,  ota_0,   0x10000,  0x1C0000,
+app1,     app,  ota_1,   0x1D0000, 0x1C0000,
+spiffs,   data, spiffs,  0x390000, 0x60000,
+coredump, data, coredump,0x3F0000, 0x10000,

@@ -1,0 +1,18 @@
+# 依赖与产物
+out/
+build/
+dist/
+*.elf
+*.map
+
+# 本地凭据（wifi_config.h 只提交占位符，别在本地改完就提交）
+build_stamp.h
+*.secrets.h
+.env
+.env.*
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
