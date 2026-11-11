@@ -395,7 +395,7 @@ RESET          重启设备
         <button onclick="scanWifi()">扫描附近网络</button>
         <button class="primary" onclick="setWifi()">保存并重启连接</button>
       </div>
-      <p class="hint" style="margin:10px 0 0">保存后设备重启，约 30 秒连上新网络。连不上会停在热点 <b id="apName">SMS-FWD-XXXX</b>（无密码，192.168.4.1）等你重新配网。</p>
+      <p class="hint" style="margin:10px 0 0">保存后设备重启，约 30 秒连上新网络。连不上会自动退回原来的 WiFi；如果原来那组也连不上，会停在热点 <b id="apName">SMS-FWD-XXXX</b>（无密码，192.168.4.1）等你重新配网。</p>
       <div class="result" id="wifiSetResult"></div>
     </div>
   </section>

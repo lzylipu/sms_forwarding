@@ -13,7 +13,6 @@ String  atExec(const char* cmd, unsigned long timeout, bool* okOut = nullptr);
 // 模组侧短信存储（ME，180 条）读取与清理
 bool modemReadStorage(int& used, int& total);
 void modemStorageTask();
-void modemStorageCheckNow();
 void modemStatusTask();
 void modemRecoveryTask();   // loop 调用：模组未就绪时定期重试初始化
 

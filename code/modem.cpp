@@ -316,12 +316,6 @@ bool modemReadStorage(int& used, int& total) {
   }
   return false;
 }
-
-// 启动后第一次检查多清一些历史，之后每次只清新积压
-void modemStorageCheckNow() {
-  s_lastStorageCheck = 0;
-}
-
 void modemStorageTask() {
   if (s_atActive || !modemReady) return;
   unsigned long now = millis();

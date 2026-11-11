@@ -28,7 +28,6 @@ String inboxListJson(int offset, int limit);
 String inboxListJson(int offset, int limit, const String& q);
 bool inboxClear();
 bool inboxDelete(int id);
-String inboxGet(int id);
 
 // 模组存储状态（由 modem 层定期刷新）
 void inboxSetModemStorage(int used, int total);

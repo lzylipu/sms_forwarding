@@ -120,29 +120,6 @@ void checkConcatTimeout() {
     }
   }
 }
-
-// 读取串口一行（含回车换行），返回行字符串，无新行时返回空
-String readSerialLine(HardwareSerial& port) {
-  static char lineBuf[SERIAL_BUFFER_SIZE];
-  static int linePos = 0;
-
-  while (port.available()) {
-    char c = port.read();
-    if (c == '\n') {
-      lineBuf[linePos] = 0;
-      String res = String(lineBuf);
-      linePos = 0;
-      return res;
-    } else if (c != '\r') {  // 跳过\r
-      if (linePos < SERIAL_BUFFER_SIZE - 1)
-        lineBuf[linePos++] = c;
-      else
-        linePos = 0;  //超长报错保护，重头计
-    }
-  }
-  return "";
-}
-
 // 检查字符串是否为有效的十六进制PDU数据
 bool isHexString(const String& str) {
   if (str.length() == 0) return false;
@@ -387,9 +364,4 @@ void processPduLine(const String& line) {
   } else {
     processSmsContent(pdu.getSender(), pdu.getText(), formatSmsTime(pdu.getTimeStamp()).c_str());
   }
-}
-
-// 兼容旧入口：串口读取已统一交给 modemPump()
-void checkSerial1URC() {
-  modemPump();
 }

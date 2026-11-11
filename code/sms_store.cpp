@@ -290,21 +290,6 @@ String inboxListJson(int offset, int limit, const String& q) {
   f.close();
   return out;
 }
-
-String inboxGet(int id) {
-  File f = LittleFS.open(INBOX_PATH, "r");
-  if (!f) return "";
-  String found;
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    if (line.length() < 5) continue;
-    String idStr;
-    if (parseField(line, "id", idStr) && idStr.toInt() == id) { found = line; break; }
-  }
-  f.close();
-  return found;
-}
-
 bool inboxDelete(int id) {
   File src = LittleFS.open(INBOX_PATH, "r");
   if (!src) return false;
