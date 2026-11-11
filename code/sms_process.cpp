@@ -260,6 +260,17 @@ void processAdminCommand(const char* sender, const char* text) {
   }
 }
 
+// 邮件标题安全化：压成单行 + 按 UTF-8 字符边界截断，避免拆开汉字
+static String smsHeaderSafe(const String& in, int maxBytes) {
+  String s = in;
+  s.replace("\r", " ");
+  s.replace("\n", " ");
+  if (s.length() <= (unsigned)maxBytes) return s;
+  int cut = maxBytes;
+  while (cut > 0 && ((uint8_t)s.charAt(cut) & 0xC0) == 0x80) cut--;
+  return s.substring(0, cut) + "…";
+}
+
 // 处理最终的短信内容（管理员命令检查和转发）
 void processSmsContent(const char* sender, const char* text, const char* timestamp) {
   logCaptureLn(String("=== 处理短信内容 ==="));
@@ -294,7 +305,9 @@ void processSmsContent(const char* sender, const char* text, const char* timesta
   // 发送通知http（推送到所有启用的通道）
   sendSMSToServer(sender, text, timestamp);
   // 发送通知邮件
-  String subject = ""; subject+="短信";subject+=sender;subject+=",";subject+=text;
+  // 以前直接把整条短信拼进邮件标题：长短信里带换行，等于往 SMTP 头部注入换行，
+  // 标题还会超长被服务器拒收。这里压成一行、限长、并在 UTF-8 字符边界截断。
+  String subject = "短信 " + String(sender) + "：" + smsHeaderSafe(String(text), 48);
   String body = ""; body+="来自：";body+=sender;body+="，时间：";body+=timestamp;body+="，内容：";body+=text;
   sendEmailNotification(subject.c_str(), body.c_str());
 }

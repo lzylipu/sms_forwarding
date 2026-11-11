@@ -26,6 +26,43 @@ static String s_respPrefix;         // 当前命令期望的响应前缀，如 "
 static int s_pendIdx[8];
 static int s_pendCnt = 0;
 
+// ------------------------------------------------------------
+// PDU 处理队列
+// ------------------------------------------------------------
+// 为什么不在 modemPump 里直接解析 PDU：
+// 解析完要入库、发 HTTP 推送、发邮件，这些都会阻塞几百毫秒到几十秒。
+// 在 pump 内部做，整个过程串口没人读，rx 缓冲(2048B)溢出就丢短信。
+// 而且推送/邮件/管理命令里还会再调 atExec()，形成 modemPump 递归，
+// 内层会把外层正在等的响应吃掉。
+// 所以 pump 只负责「把完整 PDU 行搬进队列」，真正的处理放到 loop 里做。
+#define PDU_QUEUE_LEN 4
+static String s_pduQ[PDU_QUEUE_LEN];
+static int s_pduHead = 0, s_pduTail = 0, s_pduCnt = 0;
+
+static void enqueuePdu(const String& line) {
+  if (s_pduCnt >= PDU_QUEUE_LEN) {
+    logCaptureLn(String("[短信] ⚠️ PDU 队列已满，丢弃最早一条"));
+    s_pduHead = (s_pduHead + 1) % PDU_QUEUE_LEN;
+    s_pduCnt--;
+  }
+  s_pduQ[s_pduTail] = line;
+  s_pduTail = (s_pduTail + 1) % PDU_QUEUE_LEN;
+  s_pduCnt++;
+}
+
+bool modemPduPending() { return s_pduCnt > 0; }
+
+// 处理一条排队中的 PDU。只能在 loop 上下文调用，不能在 modemPump 里调用。
+bool modemProcessOnePdu() {
+  if (s_pduCnt <= 0) return false;
+  String line = s_pduQ[s_pduHead];
+  s_pduQ[s_pduHead] = "";
+  s_pduHead = (s_pduHead + 1) % PDU_QUEUE_LEN;
+  s_pduCnt--;
+  processPduLine(line);
+  return true;
+}
+
 static void enqueueSmsIndex(int idx) {
   if (s_pendCnt >= 8) {
     logCaptureLn(String("⚠️ 待取短信队列已满，丢弃索引 ") + String(idx));
@@ -92,7 +129,7 @@ static void handleUrcLine(String line) {
   if (s_expectPdu) {
     s_expectPdu = false;
     if (isHexString(line) && line.length() >= 4) {
-      processPduLine(line);
+      enqueuePdu(line);   // 只入队，解析交给 loop，避免在 pump 里做阻塞操作
       return;
     }
     // 不是 PDU，落回普通行处理
@@ -229,6 +266,9 @@ static void fetchSmsIndex(int idx) {
 void modemTask() {
   modemPump();
   if (s_atActive) return;
+
+  // 先处理排队的新短信（每条一次，保证 loop 不会长时间卡在一个处理上）
+  if (modemProcessOnePdu()) return;
   while (s_pendCnt > 0 && !s_atActive) {
     int idx = s_pendIdx[0];
     for (int i = 1; i < s_pendCnt; i++) s_pendIdx[i - 1] = s_pendIdx[i];
@@ -433,14 +473,14 @@ void modemStatusTask() {
   s_lastStatusPoll = now;
 
   switch (s_statusStep % 7) {
-    case 0: { String r = atExec("AT+CSQ", 2000, nullptr);            parseCsq(r); break; }
-    case 1: { String r = atExec("AT+CESQ", 2000, nullptr);           parseCesq(r); break; }
-    case 2: { String r = atExec("AT+COPS?", 2000, nullptr);          parseCops(r); break; }
-    case 3: { String r = atExec("AT+CCLK?", 2000, nullptr);          parseCclk(r); break; }
-    case 4: { String r = atExec("AT+MCHIPINFO=\"temp\"", 2000, nullptr); parseChipTemp(r); break; }
-    case 5: { String r = atExec("AT+CPIN?", 2000, nullptr);
+    case 0: { String r = atExec("AT+CSQ", 1500, nullptr);            parseCsq(r); break; }
+    case 1: { String r = atExec("AT+CESQ", 1500, nullptr);           parseCesq(r); break; }
+    case 2: { String r = atExec("AT+COPS?", 1500, nullptr);          parseCops(r); break; }
+    case 3: { String r = atExec("AT+CCLK?", 1500, nullptr);          parseCclk(r); break; }
+    case 4: { String r = atExec("AT+MCHIPINFO=\"temp\"", 1500, nullptr); parseChipTemp(r); break; }
+    case 5: { String r = atExec("AT+CPIN?", 1500, nullptr);
               simReady = r.indexOf("READY") >= 0; break; }
-    case 6: { String r = atExec("AT+CEREG?", 2000, nullptr);         handleCeregUrc(r.indexOf("+CEREG:") >= 0 ? r.substring(r.indexOf("+CEREG:")) : r); break; }
+    case 6: { String r = atExec("AT+CEREG?", 1500, nullptr);         handleCeregUrc(r.indexOf("+CEREG:") >= 0 ? r.substring(r.indexOf("+CEREG:")) : r); break; }
   }
   s_statusStep++;
 }
@@ -456,6 +496,24 @@ void modemPowerCycle() {
   logCaptureLn(String("EN 拉高：开启模组"));
   digitalWrite(MODEM_EN_PIN, HIGH);
   delay(6000);  // 等模组完全启动再发AT（关键）
+}
+
+// ------------------------------------------------------------
+// 模组自愈：开机初始化失败后不会自己恢复
+// ------------------------------------------------------------
+// 旧逻辑：modemInit() 失败只把 modemReady 置 false，之后再没人重试，
+// 于是设备永远卡在「模组未就绪」：不读短信、不轮询状态，网页上看不出原因，
+// 只能人工点「重启模组」。SIM 没插好、模组启动慢、上车后断电这些场景都会踩到。
+// 这里每 2 分钟重试一次初始化，成功后自动回到正常状态。
+static unsigned long s_lastRecovery = 0;
+
+void modemRecoveryTask() {
+  if (modemReady) { s_lastRecovery = millis(); return; }
+  unsigned long now = millis();
+  if (s_lastRecovery != 0 && (now - s_lastRecovery) < 120000UL) return;
+  s_lastRecovery = now;
+  logCaptureLn(String("[模组] 仍未就绪，自动重试初始化"));
+  modemInit();
 }
 
 // 重启模组（EN引脚断电重启 + 重新初始化）
@@ -568,7 +626,7 @@ void modemInit() {
 
 // 检测网络注册状态（LTE/4G），1=已注册本地, 5=已注册漫游
 bool waitCEREG() {
-  String resp = atExec("AT+CEREG?", 2000, nullptr);
+  String resp = atExec("AT+CEREG?", 1500, nullptr);
   int idx = resp.indexOf("+CEREG:");
   if (idx < 0) return false;
   String line = resp.substring(idx);

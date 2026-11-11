@@ -6,7 +6,7 @@
 ![status](https://img.shields.io/badge/status-active-success)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 ![platform](https://img.shields.io/badge/platform-ESP32--C3-red)
-![firmware](https://img.shields.io/badge/firmware-2.1.4-brightgreen)
+![firmware](https://img.shields.io/badge/firmware-2.1.5-brightgreen)
 ![ui](https://img.shields.io/badge/UI-glassmorphism-4299e1)
 
 **[中文](#-简介--overview) · [English](README_EN.md)**
@@ -34,7 +34,7 @@ No Arduino IDE required — flash it from the browser, then upgrade by uploading
 ## ✨ 特性 / Features
 
 - 📲 **免 IDE 刷机** — ESP Web Tools 在线刷写，Chrome / Edge 点一下即可；固件是**单个 `.bin`**
-- 🔄 **双系统槽 OTA** — 网页上传 `.bin` 即升级，保留 WiFi / 推送 / 邮件 / 收件箱；连续 3 次启动失败自动回滚
+- 🔄 **双系统槽 OTA** — 网页上传 `.bin` 即升级（整包与纯应用镜像自动识别），保留 WiFi / 推送 / 邮件 / 收件箱；连续 3 次启动失败自动回滚
 - 📶 **真配网流程** — 首刷后设备是空配置，开无密码热点并启动强制门户（captive portal），手机连上自动弹配网页
 - 🧠 **短信不丢** — 单串口调度器（URC 与 AT 响应不抢缓冲区）、长短信合并、模组存储自动归档清空
 - 🗂️ **本地收件箱** — LittleFS 存 300 条，支持分页、搜索、已读标记、删除
@@ -221,6 +221,7 @@ sms_forwarding/
 │   ├── index.html           # 在线刷写页（GitHub Pages）
 │   ├── ARCHITECTURE.md      # 架构与模块说明
 │   ├── API.md               # HTTP 接口文档
+│   ├── REVIEW.md            # 代码审查报告（缺陷清单 + 验证证据 + 已知限制）
 │   └── fw/                  # 刷写页用的固件与清单（CI 自动同步）
 ├── assets/                  # 文档截图
 └── .github/workflows/build.yml
@@ -232,7 +233,7 @@ sms_forwarding/
 
 ```bash
 # 本地出包（产物是单个 .bin，0x0 整片可刷，也能直接给设备 OTA）
-bash scripts/package.sh out 2.1.4 dist
+bash scripts/package.sh out 2.1.5 dist
 ```
 
 CI（`.github/workflows/build.yml`）：

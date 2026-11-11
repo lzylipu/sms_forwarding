@@ -136,7 +136,8 @@ void loop() {
   if (Serial.available()) Serial1.write(Serial.read());  // 本地串口透传调试
   modemTask();        // 唯一串口读者：URC + AT 响应 + 待取短信
   modemStorageTask(); // 模组存储满了就慢慢清，避免拒收
-  modemStatusTask();  // 每 15 秒轮一条状态指令，缓存给网页
+  modemStatusTask();  // 每 3 秒轮一条状态指令，缓存给网页
+  modemRecoveryTask();// 初始化失败时每 2 分钟自动重试，不用人点重启
   portalLoop();       // 未配网时维护门户 DNS（手机自动弹登录）
   wifiWatchdog();     // 断线重连，长时间失败降级 AP 配网
   otaHealthyTask();   // 存活够久就把新固件标记为「升级成功」

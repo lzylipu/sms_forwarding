@@ -41,7 +41,8 @@ fi
 
 mkdir -p "$OUT"
 # 关键：不填充到 4MB，成品字节数 = 0x10000 + app 大小。
-# 这样设备端 OTA 可以靠「大小超过单槽容量」判定这是整包，跳过前 64KB 直接写应用区。
+# 设备端识别整包靠内容不靠大小：整包 0x8000 处是分区表，前两字节固定 0xAA 0x50。
+# （整包 1.4x MB 比单槽 1.75MB 还小，用大小判断必然判错，所以只能看内容。）
 "$ESPTOOL" --chip esp32c3 merge-bin \
   -o "$OUT/sms_forwarding.bin" \
   --flash-mode dio --flash-freq 80m \
@@ -52,6 +53,16 @@ if [ "$OUT_SIZE" -ne $((0x10000 + SIZE)) ]; then
   echo "合并结果 $OUT_SIZE 字节，预期 $((0x10000 + SIZE))，布局不对" >&2
   exit 1
 fi
+
+# 自检：确认布局正确，避免打出一个「能刷但刷不活」的包
+python3 - "$OUT/sms_forwarding.bin" <<'PYCHK'
+import sys
+d = open(sys.argv[1], 'rb').read()
+assert d[0:1] == b'\xe9', "0x0 不是镜像（缺 bootloader）"
+assert d[0x8000:0x8002] == b'\xaa\x50', "0x8000 不是分区表，镜像布局错误"
+assert d[0x10000:0x10001] == b'\xe9', "0x10000 不是应用镜像，镜像布局错误"
+print("==> 布局自检通过: bootloader@0 / 分区表@0x8000 / app@0x10000")
+PYCHK
 
 # 在线刷写页用的清单（放在 Pages 的 docs/fw/ 下）
 BASE=${BASE_URL:-.}

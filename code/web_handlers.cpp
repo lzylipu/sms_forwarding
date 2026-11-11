@@ -29,9 +29,14 @@ static void _logCommit() {
   }
 }
 
+// 行缓冲保护：某些地方会 logCapture 半行却永远不跟随 logCaptureLn，
+// 那样 _logLine 会无限涨到撑爆堆。超过 512 字节就强制提交。
+#define LOG_LINE_MAX 512
+
 void logCapture(const String& msg) {
   Serial.print(msg);
   _logLine += msg;
+  if (_logLine.length() > LOG_LINE_MAX) _logCommit();
 }
 
 void logCapture(const char* msg) {
@@ -41,6 +46,8 @@ void logCapture(const char* msg) {
 
 void logCaptureF(const char* fmt, ...) {
   char buf[256];
+  // 单条格式化输出最长 255 字节，接在残留半行后面也不会撑爆
+
   va_list args;
   va_start(args, fmt);
   vsnprintf(buf, sizeof(buf), fmt, args);
@@ -74,7 +81,9 @@ void logCaptureLn(const char* msg) {
 #define SESSION_SLOTS 4
 #define SESSION_TTL_MS (7UL * 24UL * 3600UL * 1000UL)
 static String s_sessTok[SESSION_SLOTS];
-static unsigned long s_sessExp[SESSION_SLOTS];
+// 存「签发时刻」而不是「到期时刻」：millis() 49.7 天回绕，
+// 存绝对到期时间会在回绕后把有效会话判成过期（或反过来）。
+static unsigned long s_sessStart[SESSION_SLOTS];
 
 static String newSessionToken() {
   char buf[33];
@@ -98,18 +107,23 @@ static String cookieValue(const String& name) {
 static bool sessionValid() {
   String t = cookieValue("sid");
   if (t.length() != 32) return false;
-  unsigned long now = millis();
   for (int i = 0; i < SESSION_SLOTS; i++) {
     if (s_sessTok[i] == t) {
-      if (now > s_sessExp[i]) { s_sessTok[i] = ""; return false; }
+      if ((unsigned long)(millis() - s_sessStart[i]) > SESSION_TTL_MS) {
+        s_sessTok[i] = "";
+        return false;
+      }
       return true;
     }
   }
   return false;
 }
 
+// 给上传回调用的静默判断：不发响应，只回答「这个请求有没有有效会话」
+bool authSessionValid() { return sessionValid(); }
+
 void authSessionInvalidateAll() {
-  for (int i = 0; i < SESSION_SLOTS; i++) { s_sessTok[i] = ""; s_sessExp[i] = 0; }
+  for (int i = 0; i < SESSION_SLOTS; i++) { s_sessTok[i] = ""; s_sessStart[i] = 0; }
 }
 
 static void sessionCreate() {
@@ -118,10 +132,10 @@ static void sessionCreate() {
   unsigned long oldest = 0xFFFFFFFF;
   for (int i = 0; i < SESSION_SLOTS; i++) {
     if (s_sessTok[i].length() == 0) { slot = i; break; }
-    if (s_sessExp[i] < oldest) { oldest = s_sessExp[i]; slot = i; }
+    if (s_sessStart[i] < oldest) { oldest = s_sessStart[i]; slot = i; }
   }
   s_sessTok[slot] = t;
-  s_sessExp[slot] = millis() + SESSION_TTL_MS;
+  s_sessStart[slot] = millis();
   server.sendHeader("Set-Cookie", "sid=" + t + "; Path=/; Max-Age=604800; HttpOnly; SameSite=Lax");
 }
 
@@ -175,7 +189,7 @@ void handleLogin() {
 void handleLogout() {
   String t = cookieValue("sid");
   for (int i = 0; i < SESSION_SLOTS; i++) {
-    if (s_sessTok[i] == t) { s_sessTok[i] = ""; s_sessExp[i] = 0; }
+    if (s_sessTok[i] == t) { s_sessTok[i] = ""; s_sessStart[i] = 0; }
   }
   server.sendHeader("Set-Cookie", "sid=; Path=/; Max-Age=0");
   server.sendHeader("Location", "/login");
@@ -199,6 +213,15 @@ void handleProvision() {
   // 首次配网（还没有凭据）免登录；已有凭据时必须先登录
   if (wifiPrefsSaved() && !checkAuth()) return;
 
+  // 这个接口是给「手机连在设备热点上」的配网页用的。
+  // 如果设备已经联网、而且客户端就挂在 STA 接口上，切 STA 的瞬间 HTTP 连接会一起断，
+  // 浏览器只能干等 60 秒超时（真机实测）。这种情况直接引导去「切换网络」。
+  if (wifiPrefsSaved() && !wifiInApMode()) {
+    server.send(200, "application/json",
+                "{\"success\":false,\"message\":\"设备已联网，请用管理页「WiFi → 切换网络」修改\"}");
+    return;
+  }
+
   String ssid = server.arg("ssid");
   String pass = server.arg("pass");
   ssid.trim();
@@ -209,14 +232,25 @@ void handleProvision() {
   }
 
   logCaptureF("[配网] 收到凭据 SSID=%s，开始连接\n", ssid.c_str());
+
+  // 先把原来的凭据留住：新网络连不上的时候要能退回去，
+  // 否则用户在配网页手滑打错密码，就把一台本来正常的设备配成砖。
+  String oldSsid = wifiCurrentSsid();
+  String oldPass = wifiCurrentPass();
+
   wifiPrefsSave(ssid, pass);
 
-  bool ok = wifiConnect(20000);
+  // 关键：这里必须用 KeepAp 版本。wifiConnect() 会先关热点，
+  // 手机当场掉线，浏览器永远收不到响应 —— 表现就是「点连接并保存没反应」。
+  bool ok = wifiConnectKeepAp(ssid, pass, 20000);
   if (!ok) {
-    // 连不上就把凭据清掉，避免下次开机反复用错密码
-    wifiPrefsClear();
-    wifiStartAp("", true);
-    logCaptureLn("[配网] 连接失败，已清除凭据并留在热点模式");
+    if (oldSsid.length() > 0) {
+      wifiPrefsRestore(oldSsid, oldPass);
+      logCaptureLn(String("[配网] 新网络连不上，已恢复原凭据: ") + oldSsid);
+    } else {
+      wifiPrefsClear();
+      logCaptureLn("[配网] 连接失败，已清除无效凭据，热点保持开启");
+    }
     server.send(200, "application/json",
                 "{\"success\":false,\"message\":\"连接失败，请确认是 2.4G 网络且密码正确\"}");
     return;
@@ -427,6 +461,9 @@ void handleFlightMode() {
       
       String modeStr;
       String statusIcon;
+      // 同步缓存：/status 的 flight 字段读的就是它（之前这个变量从来没被置过位）
+      flightMode = (mode == 4 || mode == 0);
+
       if (mode == 0) {
         modeStr = "最小功能模式（关机）";
         statusIcon = "🔴";
@@ -468,6 +505,7 @@ void handleFlightMode() {
       
       if (setResp.indexOf("OK") >= 0) {
         success = true;
+        flightMode = (newMode == 4);
         if (newMode == 4) {
           message = "已开启飞行模式 ✈️<br>模组射频已关闭，无法收发短信";
         } else {
@@ -486,6 +524,7 @@ void handleFlightMode() {
     String resp = sendATCommand("AT+CFUN=4", 5000);
     if (resp.indexOf("OK") >= 0) {
       success = true;
+      flightMode = true;
       message = "已开启飞行模式 ✈️";
     } else {
       message = "开启失败: " + resp;
@@ -497,6 +536,7 @@ void handleFlightMode() {
     String resp = sendATCommand("AT+CFUN=1", 5000);
     if (resp.indexOf("OK") >= 0) {
       success = true;
+      flightMode = false;
       message = "已关闭飞行模式 🟢";
     } else {
       message = "关闭失败: " + resp;
@@ -507,9 +547,10 @@ void handleFlightMode() {
   }
   
   json += "\"success\":" + String(success ? "true" : "false") + ",";
+  json += "\"flight\":" + String(flightMode ? "true" : "false") + ",";
   json += "\"message\":\"" + message + "\"";
   json += "}";
-  
+
   server.send(200, "application/json", json);
 }
 
@@ -588,6 +629,13 @@ void handleQuery() {
         }
       }
       
+      if (valIdx < 6) {
+        message = "CESQ 返回字段不足: " + params;
+        json += "\"success\":false,\"message\":\"" + jsonEscape(message) + "\"\n}";
+        server.send(200, "application/json", json);
+        return;
+      }
+
       // RSRP转换为dBm (0-97映射到-140到-44 dBm, 99表示未知)
       int rsrp = values[5].toInt();
       String rsrpStr;
@@ -1139,29 +1187,74 @@ void handleModem() {
     return;
   }
   else if (action == "signal") {
-    logCaptureLn(String("网页端查询信号: AT+CSQ"));
-    String resp = sendATCommand("AT+CSQ", 3000);
-    int csqIdx = resp.indexOf("+CSQ:");
-    if (csqIdx >= 0) {
-      String csqLine = resp.substring(csqIdx);
-      csqLine = csqLine.substring(0, csqLine.indexOf('\n'));
-      csqLine.trim();
-      int commaIdx = csqLine.indexOf(',');
-      if (commaIdx >= 0) {
-        int rssi = csqLine.substring(csqLine.indexOf(':') + 1, commaIdx).toInt();
-        int ber = csqLine.substring(commaIdx + 1).toInt();
-        int dbm = (rssi == 99) ? -999 : (-113 + rssi * 2);
-        String quality;
-        if (rssi >= 19) quality = "优秀";
-        else if (rssi >= 14) quality = "良好";
-        else if (rssi >= 10) quality = "一般";
-        else if (rssi >= 5) quality = "较差";
-        else quality = "很差";
-        message = "RSRP: " + String(dbm) + " dBm (" + quality + "), RSSI: " + String(rssi) + ", BER: " + String(ber);
+    // 以前这里拿 +CSQ 的等级换算成 dBm 却标成 "RSRP"，单位是对的、名字是错的。
+    // 现在直接问 +CESQ 要真正的 RSRP/RSRQ，CSQ 只作为附加信息。
+    logCaptureLn(String("网页端查询信号: AT+CESQ"));
+    String resp = sendATCommand("AT+CESQ", 3000);
+    int idx = resp.indexOf("+CESQ:");
+    if (idx >= 0) {
+      String params = resp.substring(idx + 6);
+      int endIdx = params.indexOf('\n');
+      if (endIdx > 0) params = params.substring(0, endIdx);
+      params.trim();
+      String v[6];
+      int n = 0, startPos = 0;
+      for (int i = 0; i <= (int)params.length() && n < 6; i++) {
+        if (i == (int)params.length() || params.charAt(i) == ',') {
+          v[n] = params.substring(startPos, i);
+          v[n].trim();
+          n++;
+          startPos = i + 1;
+        }
+      }
+      if (n >= 6) {
+        int rsrp = v[5].toInt();
+        int rsrq = v[4].toInt();
+        int rsrpDbm = (rsrp >= 0 && rsrp <= 97) ? (-140 + rsrp) : -999;
+        String rsrpStr = (rsrpDbm == -999) ? String("未知")
+                        : (String(rsrpDbm) + " dBm" + (rsrpDbm >= -90 ? "（良好）" : (rsrpDbm >= -105 ? "（一般）" : "（弱）")));
+        String rsrqStr = (rsrq >= 0 && rsrq <= 34) ? (String(-19.5 + rsrq * 0.5, 1) + " dB") : String("未知");
+        message = "RSRP: " + rsrpStr + ", RSRQ: " + rsrqStr;
         success = true;
       }
     }
+    if (success) {
+      String csqResp = sendATCommand("AT+CSQ", 3000);
+      int ci = csqResp.indexOf("+CSQ:");
+      if (ci >= 0) {
+        String line = csqResp.substring(ci + 5);
+        line.trim();
+        int c = line.indexOf(',');
+        if (c > 0) message += ", CSQ: " + line.substring(0, c) + " / 31";
+      }
+    }
     if (!success) message = "无法获取信号: " + resp;
+  }
+  else if (action == "ati") {
+    // 页面「查询」卡片有这个按钮，但服务端以前没有对应分支，点了只会回「未知操作」
+    logCaptureLn(String("网页端查询模组版本: ATI"));
+    String resp = sendATCommand("ATI", 3000);
+    if (resp.indexOf("OK") >= 0) {
+      String lines[6];
+      int ln = 0, lineStart = 0;
+      for (int i = 0; i <= (int)resp.length() && ln < 6; i++) {
+        if (i == (int)resp.length() || resp.charAt(i) == '\n') {
+          String l = resp.substring(lineStart, i);
+          l.trim();
+          if (l.length() > 0 && l != "ATI" && l != "OK") lines[ln++] = l;
+          lineStart = i + 1;
+        }
+      }
+      message = "";
+      for (int i = 0; i < ln; i++) {
+        if (i) message += " / ";
+        message += lines[i];
+      }
+      success = (message.length() > 0);
+      if (!success) message = "ATI 无返回内容";
+    } else {
+      message = "ATI 失败: " + resp;
+    }
   }
   else if (action == "operator") {
     logCaptureLn(String("网页端查询运营商: AT+COPS?"));
@@ -1314,7 +1407,8 @@ void handleInbox() {
 void handleInboxRead() {
   if (!checkAuth()) return;
   String id = server.arg("id");
-  if (id == "all") {
+  // 页面按钮传的是 all=1，历史接口是 id=all，两种都认
+  if (id == "all" || server.arg("all") == "1") {
     inboxMarkAllRead();
   } else {
     inboxMarkRead(id.toInt());

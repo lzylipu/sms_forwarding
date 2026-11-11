@@ -38,20 +38,42 @@ bool wifiPrefsSaved() {
   return s_ssid.length() > 0;
 }
 
-void wifiPrefsSave(const String& ssid, const String& pass) {
+// 真正落盘的函数。keepBackup=true 时把「当前这组」挪到 ssid_old/pass_old，
+// 这样新填的一组如果连不上，开机还能退回上次可用的那组（见 wifiConnect）。
+static void prefsWrite(const String& ssid, const String& pass, bool keepBackup) {
   preferences.begin(WIFI_NVS_NAMESPACE, false);
+  if (keepBackup) {
+    String cur = preferences.getString("ssid", "");
+    String curPass = preferences.getString("pass", "");
+    if (cur.length() > 0 && (cur != ssid || curPass != pass)) {
+      preferences.putString("ssid_old", cur);
+      preferences.putString("pass_old", curPass);
+    }
+  }
   preferences.putString("ssid", ssid);
   preferences.putString("pass", pass);
   preferences.end();
   s_ssid = ssid;
   s_pass = pass;
+}
+
+void wifiPrefsSave(const String& ssid, const String& pass) {
+  prefsWrite(ssid, pass, true);
   logCaptureLn(String("[WiFi] 凭据已写入 NVS: ") + ssid);
+}
+
+// 回滚用：把旧凭据写回当前位，但不要拿它污染备份槽
+void wifiPrefsRestore(const String& ssid, const String& pass) {
+  prefsWrite(ssid, pass, false);
+  logCaptureLn(String("[WiFi] 凭据已恢复为: ") + ssid);
 }
 
 void wifiPrefsClear() {
   preferences.begin(WIFI_NVS_NAMESPACE, false);
   preferences.remove("ssid");
   preferences.remove("pass");
+  preferences.remove("ssid_old");
+  preferences.remove("pass_old");
   preferences.end();
   s_ssid = "";
   s_pass = "";
@@ -61,10 +83,49 @@ String wifiCurrentSsid() {
   return s_ssid;   // 只看 NVS，编译期宏不再作为来源
 }
 
+String wifiCurrentPass() {
+  return s_pass;
+}
+
+// 配网专用：STA 去连新 AP，但**保留热点**。
+// 不能复用 wifiConnect() —— 它会先 softAPdisconnect()，手机当场掉线，
+// 页面上的「连接并保存」就永远等不到响应（真机上就是这个观感：点了没反应）。
+bool wifiConnectKeepAp(const String& ssid, const String& pass, unsigned long timeoutMs) {
+  if (ssid.length() == 0) return false;
+
+  WiFi.mode(WIFI_AP_STA);          // 保住热点
+  WiFi.setSleep(false);
+  WiFi.disconnect(false, true);    // 只断开 STA，不动 AP
+  delay(50);
+  logCaptureLn(String("[配网] 连接 ") + ssid + "（热点保持）");
+  WiFi.begin(ssid.c_str(), pass.c_str());
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
+    blink_short(150);
+    delay(1);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    s_lastOkMs = millis();
+    s_downSince = 0;
+    logCaptureLn(String("[配网] 已连接, IP=") + WiFi.localIP().toString());
+    return true;
+  }
+  logCaptureLn(String("[配网] 连接失败: ") + ssid);
+  return false;
+}
+
 static bool tryConnect(const String& ssid, const String& pass, unsigned long timeoutMs) {
   if (ssid.length() == 0) return false;
 
+  // 上一次尝试失败后，驱动可能仍处于 connecting 状态；此时改配置会被直接拒绝：
+  //   E wifi: sta is connecting, cannot set config
+  // 结果就是「换一组凭据重试」永远连不上（本项目的兜底逻辑就是这么被卡死的）。
+  // 必须先显式断开、等状态落定，再设配置。
+  WiFi.disconnect(true, false);   // 断连并停掉 STA，但不清除已保存的 AP 信息
+  delay(200);
   WiFi.mode(WIFI_STA);
+  delay(50);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   WiFi.setScanMethod(WIFI_FAST_SCAN);
@@ -100,7 +161,23 @@ bool wifiConnect(unsigned long timeoutMs) {
     logCaptureLn("[WiFi] 没有可用的 NVS 凭据，跳过连接");
     return false;
   }
-  return tryConnect(s_ssid, s_pass, timeoutMs);
+  if (tryConnect(s_ssid, s_pass, timeoutMs)) return true;
+
+  // 新凭据连不上 → 退回上次可用的那组。
+  // 场景：用户在「切换网络」里打错一个字，设备重启后就连不回来了，
+  // 以前要等 5 分钟看门狗降级成热点才救得回来。
+  preferences.begin(WIFI_NVS_NAMESPACE, true);
+  String oldS = preferences.getString("ssid_old", "");
+  String oldP = preferences.getString("pass_old", "");
+  preferences.end();
+  if (oldS.length() > 0 && oldS != s_ssid) {
+    logCaptureLn(String("[WiFi] 新凭据连不上，改用上次可用的: ") + oldS);
+    if (tryConnect(oldS, oldP, timeoutMs)) {
+      prefsWrite(oldS, oldP, false);   // 恢复成当前凭据，下次开机不再试错的那组
+      return true;
+    }
+  }
+  return false;
 }
 
 bool wifiStartAp(const String& pass, bool sticky) {
@@ -184,7 +261,8 @@ void wifiWatchdog() {
     if (s_ssid.length() > 0 && millis() - lastApRetry > 30000) {
       lastApRetry = millis();
       logCaptureLn(String("[WiFi] 配网模式后台重试: ") + s_ssid);
-      WiFi.disconnect();
+      WiFi.disconnect(true, false);
+      delay(200);                 // 等驱动落定，否则 config 会被拒（sta is connecting）
       WiFi.begin(s_ssid.c_str(), s_pass.c_str());
     }
     return;
@@ -215,7 +293,8 @@ void wifiWatchdog() {
       return;
     }
     // 没有自己的密码就用 NVS 里的；不要再退回编译期宏（可能是占位符）
-    WiFi.disconnect();
+    WiFi.disconnect(true, false);
+    delay(200);
     WiFi.begin(ssid.c_str(), s_pass.c_str());
   }
 

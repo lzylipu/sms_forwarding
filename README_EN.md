@@ -6,7 +6,7 @@
 ![status](https://img.shields.io/badge/status-active-success)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 ![platform](https://img.shields.io/badge/platform-ESP32--C3-red)
-![firmware](https://img.shields.io/badge/firmware-2.1.4-brightgreen)
+![firmware](https://img.shields.io/badge/firmware-2.1.5-brightgreen)
 ![ui](https://img.shields.io/badge/UI-glassmorphism-4299e1)
 
 **[English](#-overview) · [中文](README.md)**
@@ -213,6 +213,7 @@ sms_forwarding/
 │   ├── index.html           # browser flasher (GitHub Pages)
 │   ├── ARCHITECTURE.md      # architecture notes
 │   ├── API.md               # HTTP API reference
+│   ├── REVIEW.md            # code review report (defects, evidence, known limits)
 │   └── fw/                  # firmware + manifest served to the flasher
 ├── assets/                  # documentation screenshots
 └── .github/workflows/build.yml
@@ -224,7 +225,7 @@ sms_forwarding/
 
 ```bash
 # Local packaging (single .bin: flashable at 0x0, also accepted by in-device OTA)
-bash scripts/package.sh out 2.1.4 dist
+bash scripts/package.sh out 2.1.5 dist
 ```
 
 CI (`.github/workflows/build.yml`):

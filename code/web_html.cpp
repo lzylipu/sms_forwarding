@@ -448,7 +448,7 @@ RESET          重启设备
         <div><b>运行槽</b><span id="fwSlot">--</span></div>
         <div><b>槽容量</b><span id="fwSize">--</span></div>
         <div><b>编译时间</b><span id="fwBuilt">--</span></div>
-        <div><b>上次升级</b><span id="fwLast">--</span></div>
+        <div><b>上次升级结果</b><span id="fwLast">--</span></div>
         <div><b>Git 版本</b><span id="fwRev">--</span></div>
       </div>
     </div>
@@ -460,7 +460,7 @@ RESET          重启设备
         <button onclick="loadFw()">刷新信息</button>
       </div>
       <div class="result" id="fwResult"></div>
-      <p class="hint" style="margin:10px 0 0">约 1.4MB，20–60 秒。<b>升级期间请勿断电。</b>完成后自动重启，页面会自动重连。</p>
+      <p class="hint" style="margin:10px 0 0">直接上传 Release 里的 <b>sms_forwarding.bin</b>（整包 1.4 MB）或纯应用镜像都行，设备会自动识别。<b>升级期间请勿断电。</b>完成后自动重启，WiFi 与配置保留，但登录会话会失效，需要重新登录。</p>
     </div>
   </section>
 
@@ -609,7 +609,7 @@ function loadInbox(){
 }
 function markRead(id){var b=new URLSearchParams();b.append('id',id);api('/inbox/read',{method:'POST',body:b}).then(function(){loadInbox();loadRecent();poll();});}
 function delMsg(id){if(!confirm('删除这条短信？'))return;var b=new URLSearchParams();b.append('id',id);api('/inbox/delete',{method:'POST',body:b}).then(function(){loadInbox();loadRecent();poll();});}
-function markAll(){api('/inbox/read?all=1',{method:'POST'}).then(function(){toast('已全部标为已读','ok');loadInbox();poll();});}
+function markAll(){api('/inbox/read?id=all',{method:'POST'}).then(function(){toast('已全部标为已读','ok');loadInbox();poll();});}
 
 function save(ev,formId,rid){
   ev.preventDefault();
@@ -719,7 +719,7 @@ function uploadFw(){
 function waitBack(){
   var n=0,t=setInterval(function(){
     n++;
-    getJSON('/api/firmware/info').then(function(d){clearInterval(t);res('fwResult','ok','新固件已启动：'+esc(d.version)+'（'+esc(d.slot)+'）');loadFw();toast('设备已恢复','ok');})
+    getJSON('/api/firmware/info').then(function(d){clearInterval(t);res('fwResult','ok','新固件已启动：'+esc(d.version)+'（'+esc(d.slot)+'）','keep');loadFw();toast('设备已恢复','ok');})
     .catch(function(){if(n>40)clearInterval(t);});
   },2000);
 }

@@ -429,7 +429,9 @@ bool sendToChannel(const PushChannel& channel, const char* sender, const char* m
 
       reqUrl = tgBaseUrl + "/bot" + channel.key2 + "/sendMessage";
 
-      String text = "📱短信通知\n发送者: " + senderEscaped + "\n内容: " + messageEscaped + "\n时间: " + timestampEscaped;
+      // 注意：这里必须是 JSON 转义后的 \\n。以前写的是真实换行符，
+      // 拼进 requestBody 就是非法 JSON，Telegram 一律返回 400。
+      String text = "📱短信通知\\n发送者: " + senderEscaped + "\\n内容: " + messageEscaped + "\\n时间: " + timestampEscaped;
       reqBody = "{";
       reqBody += "\"chat_id\":\"" + channel.key1 + "\",";
       reqBody += "\"text\":\"" + text + "\"";

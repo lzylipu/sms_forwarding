@@ -16,6 +16,7 @@ void logCaptureLn(const String& msg);
 void logCaptureLn(const char* msg);
 
 bool checkAuth();
+bool authSessionValid();   // 静默判断会话（上传回调用，不发响应）
 void handleLogin();
 void handleLogout();
 void handleProvisionPage();
