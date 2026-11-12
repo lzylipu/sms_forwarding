@@ -1,1 +1,1 @@
-345b734e95a402d09b5cf3c3585ec6e034105c80ef1c8c93a1bc5769e077b3a8  sms_forwarding.bin
+4d6eabbaa70e1be5079e76e14fc98e6099c767fa5466f7afc6d4219ddc615297  sms_forwarding.bin

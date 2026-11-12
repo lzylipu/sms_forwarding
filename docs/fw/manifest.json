@@ -1,6 +1,6 @@
 {
   "name": "短信转发器 (ESP32-C3 + ML307R)",
-  "version": "2.1.5",
+  "version": "2.1.6",
   "builds": [
     {
       "chipFamily": "ESP32-C3",
