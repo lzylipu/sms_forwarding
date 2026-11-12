@@ -22,6 +22,9 @@
 #define LED_BUILTIN 8
 #endif
 
+// 本地时区偏移（秒）。默认东八区；不在东八区就改这里。
+#define TZ_OFFSET_SEC (8 * 3600)
+
 #define SERIAL_BUFFER_SIZE 2048
 #define MAX_PDU_LENGTH 300
 #define MODEM_LINE_MAX 640       // 单行最大长度（长短信 PDU 约 340 字符）

@@ -1002,8 +1002,16 @@ void handlePushTest() {
       server.send(200, "application/json", "{\"success\":false,\"message\":\"通道号超出范围\"}");
       return;
     }
-    notifySms("10086", "这是一条测试消息：经由后台通知任务发送。", "测试消息",
-              "通知任务自检", "这条消息用来验证后台通知任务是否正常工作。");
+    // raw=1：按真实短信的格式发（标题为「短信来自: …」），用来预览实际收到时长什么样
+    bool raw = server.hasArg("raw");
+    String now = smsNowString();
+    notifySms(raw ? "10086" : "设备自检",
+              raw ? "【预览】这条消息用真实短信的格式发送，方便确认手机上的观感。"
+                  : "通道配置自检",
+              now.c_str(),
+              raw ? "短信 10086：【预览】" : "[测试] 后台通知任务自检",
+              raw ? "这是一条格式预览，不是真实短信。" : "这条消息用来验证后台通知任务是否正常工作。",
+              !raw);
     server.send(200, "application/json", "{\"success\":true,\"queued\":true,\"message\":\"已交给后台任务，结果见日志\"}");
     return;
   }

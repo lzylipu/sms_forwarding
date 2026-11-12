@@ -85,7 +85,10 @@ void setup() {
   // ---- NTP 时间同步（AP 模式下无外网，直接跳过）----
   if (staOk) {
     logCaptureLn(String("正在同步NTP时间..."));
-    configTime(0, 0, "ntp.ntsc.ac.cn", "ntp.aliyun.com", "pool.ntp.org");
+    // 第三、四个参数是时区与夏令时偏移。以前写成 0/0，localtime() 返回的是 UTC，
+    // 于是「测试推送」里的时间和手机上的时间差 8 小时。短信时间本身来自 PDU 的
+    // SCTS（运营商侧本地时间）不受影响，但设备自己产生的时间戳会错。
+    configTime(TZ_OFFSET_SEC, 0, "ntp.ntsc.ac.cn", "ntp.aliyun.com", "pool.ntp.org");
     int ntpRetry = 0;
     while (time(nullptr) < 100000 && ntpRetry < 100) {
       delay(1);

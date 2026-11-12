@@ -131,6 +131,8 @@ arduino-cli compile --fqbn esp32:esp32:makergo_c3_supermini \
 
 页面会先静默保存，再让设备真发一条测试消息，直接给成功/失败结论——不用等真短信来验证。
 
+测试消息的标题是「**[测试] 推送通道「通道1」连通正常**」，不会伪装成真实短信；真实短信的标题是「短信来自: 号码」，正文带「短信时间」。想预览真实短信在手机上长什么样，可以调 `POST /push/test?ch=0&async=1&raw=1`（见 [API 文档](docs/API.md)）。
+
 ![推送通道 / Push channels](assets/push.png)
 
 ---

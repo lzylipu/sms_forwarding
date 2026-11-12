@@ -25,6 +25,7 @@
 struct NotifyJob {
   bool   doPush;
   bool   doEmail;
+  bool   isTest = false;
   String sender, text, ts;    // 推送用
   String subject, body;       // 邮件用
 };
@@ -79,7 +80,7 @@ static bool notifyDequeue(NotifyJob& out) {
 }
 
 static void runEmailSync(const char* subject, const char* body);
-static void pushAllChannels(const char* sender, const char* message, const char* timestamp);
+static void pushAllChannels(const char* sender, const char* message, const char* timestamp, bool isTest);
 
 static void notifyWorker(void* arg) {
   NotifyJob j;
@@ -89,7 +90,7 @@ static void notifyWorker(void* arg) {
       continue;
     }
     if (s_netMux) xSemaphoreTakeRecursive(s_netMux, portMAX_DELAY);
-    if (j.doPush)  pushAllChannels(j.sender.c_str(), j.text.c_str(), j.ts.c_str());
+    if (j.doPush)  pushAllChannels(j.sender.c_str(), j.text.c_str(), j.ts.c_str(), j.isTest);
     if (j.doEmail) runEmailSync(j.subject.c_str(), j.body.c_str());
     if (s_netMux) xSemaphoreGiveRecursive(s_netMux);
     vTaskDelay(pdMS_TO_TICKS(30));
@@ -108,10 +109,11 @@ void sendEmailNotification(const char* subject, const char* body) {
 
 // 短信通知：推送 + 邮件一起入队
 void notifySms(const char* sender, const char* message, const char* timestamp,
-               const char* emailSubject, const char* emailBody) {
+               const char* emailSubject, const char* emailBody, bool isTest) {
   NotifyJob j;
   j.doPush = true;
   j.doEmail = true;
+  j.isTest = isTest;
   j.sender = sender ? sender : "";
   j.text = message ? message : "";
   j.ts = timestamp ? timestamp : "";
@@ -192,6 +194,19 @@ static void runEmailSync(const char* subject, const char* body) {
 
   logCaptureLn(String("邮件多次重试后仍失败，本次通知已丢弃"));
   smtp.stop();
+}
+
+// 当前本地时间字符串（YYYY-MM-DD HH:MM:SS）。NTP 未同步时返回 "时间未知"。
+String smsNowString() {
+  time_t now = time(nullptr);
+  if (now < 100000) return String("时间未知");
+  struct tm tmNow;
+  localtime_r(&now, &tmNow);
+  char ts[24];
+  snprintf(ts, sizeof(ts), "%04d-%02d-%02d %02d:%02d:%02d",
+           tmNow.tm_year + 1900, tmNow.tm_mon + 1, tmNow.tm_mday,
+           tmNow.tm_hour, tmNow.tm_min, tmNow.tm_sec);
+  return String(ts);
 }
 
 // URL编码辅助函数
@@ -364,7 +379,8 @@ static bool executeChannelRequest(const PushChannel& channel, const String& url,
 
 // 发送单个推送通道（统一构建请求参数，由 executeChannelRequest 执行并自动重试）
 // 返回 true 表示平台确认成功；网页的「发送测试消息」靠这个返回值给用户结论
-bool sendToChannel(const PushChannel& channel, const char* sender, const char* message, const char* timestamp) {
+bool sendToChannel(const PushChannel& channel, const char* sender, const char* message,
+                   const char* timestamp, bool isTest) {
   if (!channel.enabled) return false;
 
   // 对于某些推送方式，URL可以为空（使用默认URL）
@@ -388,9 +404,18 @@ bool sendToChannel(const PushChannel& channel, const char* sender, const char* m
   String channelName = channel.name.length() > 0 ? channel.name : ("通道" + String(channel.type));
   logCaptureLn(String("发送到推送通道: " + channelName));
 
+  // 测试消息和真实短信走同一套通道参数，但文案必须能一眼分辨：
+  // 以前测试消息伪装成「短信来自: 10086」，和真短信长得一模一样，容易误判。
+  String titleText   = isTest ? ("[测试] 推送通道「" + channelName + "」连通正常")
+                              : ("短信来自: " + String(sender));
+  String bodyText    = isTest ? ("这是一条测试消息。真实短信到达时会用同样的方式推送，不需要回复。")
+                              : String(message);
+  String timeLabel   = isTest ? "测试时间" : "短信时间";
+
   String senderEscaped = jsonEscape(String(sender));
-  String messageEscaped = jsonEscape(String(message));
+  String messageEscaped = jsonEscape(bodyText);
   String timestampEscaped = jsonEscape(String(timestamp));
+  String titleEscaped = jsonEscape(titleText);
 
   String reqUrl = "";
   String reqBody = "";
@@ -414,7 +439,7 @@ bool sendToChannel(const PushChannel& channel, const char* sender, const char* m
       // Bark推送格式
       reqUrl = channel.url;
       reqBody = "{";
-      reqBody += "\"title\":\"" + senderEscaped + "\",";
+      reqBody += "\"title\":\"" + titleEscaped + "\",";
       reqBody += "\"body\":\"" + messageEscaped + "\"";
       reqBody += "}";
       logCaptureLn(String("BARK JSON: " + reqBody));
@@ -457,7 +482,7 @@ bool sendToChannel(const PushChannel& channel, const char* sender, const char* m
       }
       reqUrl = webhookUrl;
       reqBody = "{\"msgtype\":\"text\",\"text\":{\"content\":\"";
-      reqBody += "📱短信通知\\n发送者: " + senderEscaped + "\\n内容: " + messageEscaped + "\\n时间: " + timestampEscaped;
+      reqBody += (isTest ? "🔧" : "📱") + titleText + "\\n内容: " + messageEscaped + "\\n" + timeLabel + ": " + timestampEscaped;
       reqBody += "\"}}";
       logCaptureLn(String("钉钉: " + reqBody));
       break;
@@ -479,8 +504,14 @@ bool sendToChannel(const PushChannel& channel, const char* sender, const char* m
       }
       reqBody = "{";
       reqBody += "\"token\":\"" + channel.key1 + "\",";
-      reqBody += "\"title\":\"短信来自: " + senderEscaped + "\",";
-      reqBody += "\"content\":\"<b>发送者:</b> " + senderEscaped + "<br><b>时间:</b> " + timestampEscaped + "<br><b>内容:</b><br>" + messageEscaped + "\",";
+      reqBody += "\"title\":\"" + titleEscaped + "\",";
+      if (isTest) {
+        reqBody += "\"content\":\"<b>通道配置有效</b><br><br>" + messageEscaped +
+                   "<br><br><b>" + timeLabel + ":</b> " + timestampEscaped +
+                   "<br><b>设备:</b> " + jsonEscape(getDeviceUrl()) + "\",";
+      } else {
+        reqBody += "\"content\":\"<b>发送者:</b> " + senderEscaped + "<br><b>短信时间:</b> " + timestampEscaped + "<br><b>内容:</b><br>" + messageEscaped + "\",";
+      }
       reqBody += "\"channel\":\"" + channelValue + "\"";
       reqBody += "}";
       logCaptureLn(String("PushPlus: " + reqBody));
@@ -491,7 +522,7 @@ bool sendToChannel(const PushChannel& channel, const char* sender, const char* m
       // Server酱
       reqUrl = channel.url.startsWith("http") ? channel.url : ("https://sctapi.ftqq.com/" + channel.key1 + ".send");
       reqContentType = "application/x-www-form-urlencoded";
-      reqBody = "title=" + urlEncode("短信来自: " + String(sender));
+      reqBody = "title=" + urlEncode(titleText);
       reqBody += "&desp=" + urlEncode("**发送者:** " + String(sender) + "\n\n**时间:** " + String(timestamp) + "\n\n**内容:**\n\n" + String(message));
       logCaptureLn(String("Server酱: " + reqBody));
       break;
@@ -537,7 +568,7 @@ bool sendToChannel(const PushChannel& channel, const char* sender, const char* m
       // 飞书消息体
       jsonData += "\"msg_type\":\"text\",";
       jsonData += "\"content\":{\"text\":\"";
-      jsonData += "📱短信通知\\n发送者: " + senderEscaped + "\\n内容: " + messageEscaped + "\\n时间: " + timestampEscaped;
+      jsonData += (isTest ? "🔧" : "📱") + titleText + "\\n内容: " + messageEscaped + "\\n" + timeLabel + ": " + timestampEscaped;
       jsonData += "\"}}";
 
       reqUrl = channel.url;
@@ -572,7 +603,7 @@ bool sendToChannel(const PushChannel& channel, const char* sender, const char* m
 
       // 注意：这里必须是 JSON 转义后的 \\n。以前写的是真实换行符，
       // 拼进 requestBody 就是非法 JSON，Telegram 一律返回 400。
-      String text = "📱短信通知\\n发送者: " + senderEscaped + "\\n内容: " + messageEscaped + "\\n时间: " + timestampEscaped;
+      String text = (isTest ? "🔧" : "📱") + titleText + "\\n内容: " + messageEscaped + "\\n" + timeLabel + ": " + timestampEscaped;
       reqBody = "{";
       reqBody += "\"chat_id\":\"" + channel.key1 + "\",";
       reqBody += "\"text\":\"" + text + "\"";
@@ -591,7 +622,7 @@ bool sendToChannel(const PushChannel& channel, const char* sender, const char* m
 }
 
 // 发送短信到所有启用的推送通道（同步版本，只在 notifyWorker 里跑）
-static void pushAllChannels(const char* sender, const char* message, const char* timestamp) {
+static void pushAllChannels(const char* sender, const char* message, const char* timestamp, bool isTest) {
   if (WiFi.status() != WL_CONNECTED) {
     logCaptureLn(String("WiFi未连接，跳过推送"));
     return;
@@ -613,7 +644,7 @@ static void pushAllChannels(const char* sender, const char* message, const char*
   logCaptureLn(String("\n=== 开始多通道推送 ==="));
   for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
     if (isPushChannelValid(config.pushChannels[i])) {
-      sendToChannel(config.pushChannels[i], sender, message, timestamp);
+      sendToChannel(config.pushChannels[i], sender, message, timestamp, isTest);
       delay(100); // 短暂延迟避免请求过快
     }
   }
@@ -642,17 +673,9 @@ bool pushTestChannel(int idx) {
     return false;
   }
   c.enabled = true;   // 测试时不要求先勾选开关
-  time_t now = time(nullptr);
-  char ts[24] = "测试消息";
-  if (now > 100000) {
-    struct tm tmNow;
-    localtime_r(&now, &tmNow);
-    snprintf(ts, sizeof(ts), "%04d-%02d-%02d %02d:%02d:%02d",
-             tmNow.tm_year + 1900, tmNow.tm_mon + 1, tmNow.tm_mday,
-             tmNow.tm_hour, tmNow.tm_min, tmNow.tm_sec);
-  }
+  String ts = smsNowString();
   logCaptureLn(String("\n=== 发送测试消息 ==="));
-  bool ok = sendToChannel(c, "10086", "这是一条测试消息：配置成功后会收到真实短信推送。", ts);
+  bool ok = sendToChannel(c, "设备自检", "通道配置自检", ts.c_str(), true);
   logCaptureLn(String(ok ? "=== 测试消息发送成功 ===" : "=== 测试消息发送失败 ==="));
   return ok;
 }

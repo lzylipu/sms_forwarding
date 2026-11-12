@@ -123,6 +123,8 @@ Open the device IP → you land on the login page. Default user `admin`, default
 
 The page silently saves the form first, then makes the device send a real test message and reports success or failure — no need to wait for a real SMS.
 
+Test messages are clearly labelled — title `[测试] 推送通道「通道1」连通正常` — and never masquerade as a real SMS. Real messages arrive as `短信来自: <number>` with a `短信时间` field. To preview exactly what a real SMS looks like on your phone, call `POST /push/test?ch=0&async=1&raw=1` (see [API docs](docs/API.md)).
+
 ![Push channels](assets/push.png)
 
 ---
