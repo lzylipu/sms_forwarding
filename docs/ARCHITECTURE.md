@@ -39,6 +39,7 @@ ESP32 运行本项目的 Arduino 固件，负责三件事：把模组收到的�
 | `portalLoop()` | 每轮 | 未配网时维护门户 DNS（53 端口通配） |
 | `wifiWatchdog()` | 每轮 | 断线重连；连续 5 分钟失败降级为 AP |
 | `otaHealthyTask()` | 每 5s 查一次 | 存活够 45s 即把新固件标记为「升级成功」 |
+| `smsSendTask()` | 每轮 | 推进异步发信状态机（等 `>` 提示符 / 等 `+CMGS` / 排空），绝不在这里死等 |
 | `otaLoop()` | 每轮 | 升级完成后的延迟重启 |
 
 ## 串口调度
@@ -59,15 +60,50 @@ ESP32 运行本项目的 Arduino 固件，负责三件事：把模组收到的�
 +CMT URC 或 modemStorageTask 主动读取
         │
         ▼
+  PDU 队列（4 槽，只搬字符串，不做解析）
+        │  loop() 每轮取一条
+        ▼
   sms_process: PDU 解码 → 分片合并（30s 超时，按 UDH 重组）
         │
         ├─► sms_store: 写 /inbox.jsonl（去重、超过 300 条压缩）
-        └─► push: 5 个通道逐个推送 + SMTP 邮件
+        └─► notifySms(): 塞进通知队列（4 槽）后立即返回
+                          │
+                          ▼  独立 FreeRTOS 任务 notifyWorker
+                    push: 5 个通道逐个推送  +  SMTP 邮件
 ```
 
 - 长短信按 UDH 的参考号合并，超时未齐的分片也会落地，不会一直挂内存
 - 推送失败重试 3 次（0.5s / 1s 退避），仍失败则丢弃并在日志说明
 - 平台返回 200 但业务失败的（钉钉 `errcode`、PushPlus `code`、飞书 `code`、Server酱、Telegram `ok`）会解析响应体再判定
+
+### 为什么通知要单独开任务
+
+一条短信进来要打 5 个通道（每个最多 3 次重试）再发一封 SMTP（也是 3 次全流程）。全部串在 `loop()` 里时，这段时间 `server.handleClient()` 不跑（网页像死机）、`modemPump()` 不跑（串口 2KB 缓冲几秒就满，短信直接丢）。2.1.6 把「发」这件事挪到独立任务：
+
+- `loop()` 只做 `notifySms()` / `sendEmailNotification()`，两者都是纯内存入队，微秒级返回
+- 队列满（4 条积压）时丢最早一条并置位 `notifyHadDrop()`，避免把堆撑爆
+- `s_netMux` 递归互斥锁串行化所有网络动作：后台任务和网页「发送测试消息」不会同时用 `ssl_client` / SMTP
+- 日志从此是跨任务共享的，`logCapture*` 全部套 `s_logMux`（递归互斥锁），否则两个任务同时 `String +=` 会写坏堆
+
+### 发短信为什么改成状态机
+
+`AT+CMGS` 要两段握手：先发命令等 `>`，再发 PDU 等 `+CMGS` 回执，慢的时候整段要 35 秒。旧实现用 `while` 死等，`loop()` 整个停住。现在拆成 `IDLE → PROMPT → RESULT`，每轮 `loop()` 只往前走一步：
+
+- `PROMPT` 阶段等 `>` 提示符，超时 5 秒
+- 收到提示符立刻写 PDU + `0x1A`，转 `RESULT`，同时释放 PDU 字符串
+- `RESULT` 阶段等 `+CMGS`/`ERROR`，超时 30 秒
+- 失败时先补一个 `0x1B`（ESC）让模组退出「等正文」模式，再进入 3 秒 `DRAIN` 状态吞掉迟到响应——否则下一条 AT 命令会把上一条的回执当成自己的
+- 发信期间 `atExec()` 直接返回失败，不让别的命令插队（两条命令的响应会互相吃掉）
+- 结果通过 `/status` 的 `tx` 段暴露给网页，页面轮询取回执
+
+### TLS 策略
+
+`applyTlsPolicy(WiFiClientSecure&)` 是唯一的证书设置入口：
+
+- 配了 `tlsCaCert`（PEM）→ `setCACert()`，真正校验证书链
+- 没配 → `setInsecure()`，只加密不验证；页面上会明确写出这个风险
+
+另外 https 的推送通道必须用 `WiFiClientSecure`。`HTTPClient::begin(url)` 内部 new 的是明文 `WiFiClient`，对 443 端口做不了握手——2.1.5 及以前所有 https 通道（Telegram、Server酱、自建 https 地址）实际上 100% 失败。2.1.6 按 URL 前缀显式 new 对应的客户端，并成对 `delete`。
 
 ## 存储
 
@@ -112,6 +148,7 @@ ESP32 运行本项目的 Arduino 固件，负责三件事：把模组收到的�
 - 页面登录 → `/login` 校验后下发 `sid`（32 位十六进制，`esp_random()`）
 - 只存 RAM，4 个槽位，7 天过期，退出即失效
 - `checkAuth()` 对页面请求 302 到 `/login`，对接口返回 401 JSON
+- **CSRF 双提交校验**：会话 token 既在 `HttpOnly` Cookie 里，也内联进页面 `<meta name="csrf">`。非 GET 请求必须带 `X-CSRF-Token`（或表单字段 `_csrf`）且与 Cookie 一致，`/login` 与首次配网豁免。跨站页面读不到同源页面内容，因此伪造请求拿不到这个值
 - **文件上传回调跑在任何路由处理之前**：`/api/ota` 的 `UPLOAD_FILE_START` 必须自己调 `authSessionValid()`，否则未登录者可以直接写固件并切走启动槽
 - ⚠️ 前提是 `server.collectHeaders({"Cookie","Accept"})` —— WebServer 默认不采集任何请求头，漏了这步 `server.header("Cookie")` 永远是空串
 
@@ -124,5 +161,6 @@ ESP32 运行本项目的 Arduino 固件，负责三件事：把模组收到的�
 ## 内存预算
 
 - 静态 RAM 约 45KB / 327KB（13%）
-- 固件约 1.41MB / 1.75MB 单槽（77%）
-- 运行期空闲堆约 165KB，首页分块渲染峰值几 KB
+- 固件约 1.43MB / 1.75MB 单槽（77%）
+- 运行期空闲堆约 160KB（通知任务栈 9KB 常驻），首页分块渲染峰值几 KB
+- 15 分钟浸泡（30 次采样）堆抖动约 4KB，无单调下降趋势

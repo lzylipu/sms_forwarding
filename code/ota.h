@@ -2,7 +2,7 @@
 #include <Arduino.h>
 
 // 固件版本号：每次发版改这里，网页「固件升级」面板和 /api/firmware/info 都会读它
-#define FW_VERSION "2.1.5"
+#define FW_VERSION "2.1.6"
 
 // OTA 启动失败几次后自动回滚（panic 重启 / 卡死重启都会计数）
 #define OTA_MAX_TRIES 3

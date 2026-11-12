@@ -6,7 +6,7 @@
 ![status](https://img.shields.io/badge/status-active-success)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 ![platform](https://img.shields.io/badge/platform-ESP32--C3-red)
-![firmware](https://img.shields.io/badge/firmware-2.1.5-brightgreen)
+![firmware](https://img.shields.io/badge/firmware-2.1.6-brightgreen)
 ![ui](https://img.shields.io/badge/UI-glassmorphism-4299e1)
 
 **[English](#-overview) · [中文](README.md)**
@@ -29,11 +29,14 @@ No Arduino IDE required — flash it from the browser with ESP Web Tools, then u
 - 🔄 **Dual-slot OTA** — upload `.bin` from the web UI, keeps WiFi / push / SMTP / inbox; automatic rollback after 3 failed boots
 - 📶 **Real provisioning** — after flashing the device is empty: it opens an open hotspot with a captive portal, the phone auto-pops the setup page
 - 🧠 **No lost SMS** — single serial scheduler (URCs never race AT responses), multi-part SMS reassembly, modem storage auto-archived and drained
+- ⚡ **Responsive main loop** — push and email go out from a dedicated background task, and sending SMS is a state machine, so a slow network never freezes the UI or drops messages
 - 🗂️ **Local inbox** — 300 messages on LittleFS with paging, search, read flags and delete
 - 🔀 **10 push back-ends** — up to 5 channels at once, fields adapt to the selected type, every channel has a "send test message" button
 - 📮 **Email forwarding** — SMTP via ReadyMail, SSL / STARTTLS
 - 🖥️ **Glassmorphism console** — dashboard aggregates everything plus quick actions and direct SMS sending; other features in their own tabs; light/dark themes, mobile-friendly
-- 🔐 **Page login** — cookie session (HttpOnly, 7 days) instead of the browser's native Basic-auth popup
+- 🔐 **Page login** — cookie session (HttpOnly, 7 days) plus double-submit CSRF validation, instead of the browser's native Basic-auth popup
+- 🛡️ **Optional certificate pinning** — paste a TLS root CA and SMTP / HTTPS pushes really verify the chain; without one the UI says so plainly
+- 📩 **Remote admin** — text `STATUS` / `WIFI` / `LOG` / `SMS:` / `RESET` / `HELP` from the admin number, results come back by email
 - 🧪 **Network self-test** — modem-side `AT+MPING`, default target `223.5.5.5`, custom host and count
 - 🛠️ **CI packaging** — pinned toolchain in GitHub Actions, tag pushes publish a Release
 
@@ -155,12 +158,23 @@ Everything else has its own tab: **Inbox / Push channels / Email / Admin & black
 
 **Email**: SMTP with SSL/STARTTLS. Fill server / port / user / password / recipient and it is enabled; incomplete config is skipped and logged.
 
+**TLS verification (optional)**: the email page has a "TLS root CA (PEM)" box shared by SMTP and HTTPS pushes:
+
+- empty → encrypted but not verified; the UI says so explicitly
+- pasted CA → `setCACert()`, full chain verification against man-in-the-middle
+
 **Admin remote commands** (send an SMS to the device from the registered admin number):
 
 | Command | Effect |
 |---|---|
 | `SMS:<number>:<text>` | device sends that SMS for you |
+| `STATUS` | uptime, free heap, signal, inbox summary |
+| `WIFI` | current WiFi and IP |
+| `LOG` | last 20 log lines |
 | `RESET` | reboot the device |
+| `HELP` | list every command |
+
+Every command replies **by email**, never by SMS (to avoid charges) — so remote admin needs SMTP configured.
 
 ---
 
@@ -225,7 +239,7 @@ sms_forwarding/
 
 ```bash
 # Local packaging (single .bin: flashable at 0x0, also accepted by in-device OTA)
-bash scripts/package.sh out 2.1.5 dist
+bash scripts/package.sh out 2.1.6 dist
 ```
 
 CI (`.github/workflows/build.yml`):
@@ -250,16 +264,21 @@ CI (`.github/workflows/build.yml`):
 | PushPlus delivers nothing | Fill the **Token** (not the topic), channel `wechat` |
 | Modem temperature shows "unsupported" | No sensor on this board, expected |
 | Config lost after upgrade | Only full-chip writes (offset 0x0) erase NVS. Uploading `.bin` via the web UI keeps everything |
+| Sending SMS returns "network timeout (332)" | The carrier never acknowledged. Usually **the SIM is out of credit** or the carrier is throttling — not a firmware issue. Top up and it recovers immediately |
+| Write actions return 403 "session token expired" | 2.1.6 CSRF protection: page sat too long, or you used curl. Reload the page; scripts must send `X-CSRF-Token` equal to `sid` |
+| Nothing happens on save, log says "notify queue busy" | A push/email is in flight. Retry in a few seconds; more than 4 queued notifications drops the oldest one (logged) |
 
 ---
 
 ## 🗺️ Roadmap
 
-- [ ] Move push / SMTP to an async queue (currently blocks the main loop)
-- [ ] Async SMS sending (up to 35 s blocking today)
-- [ ] CSRF tokens and real TLS verification
-- [ ] Cap the log buffer
-- [ ] More admin SMS commands (`STATUS` / `WIFI` / `PUSH`)
+- [x] Move push / SMTP to an async queue (2.1.6)
+- [x] Async SMS sending state machine (2.1.6)
+- [x] CSRF tokens and optional TLS root-CA verification (2.1.6)
+- [x] Cap the log buffer (2.1.5)
+- [x] More admin SMS commands (2.1.6)
+- [ ] WebSocket instead of 3-second polling
+- [ ] Unread indicator on the LED / buzzer
 
 ---
 

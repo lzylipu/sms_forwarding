@@ -198,6 +198,13 @@ void handleOtaUploadFile() {
       logCaptureLn("[OTA] 上传请求没有有效会话，已拒绝");
       return;
     }
+    // 会话有效还不够：浏览器跨站表单也能带上 Cookie，必须再验 CSRF 头
+    if (!authCsrfValid()) {
+      s_otaState = "error";
+      s_otaMsg = "CSRF 校验失败，请刷新页面重试";
+      logCaptureLn("[OTA] 上传请求缺少有效 CSRF 令牌，已拒绝");
+      return;
+    }
 
     s_peek = (uint8_t*)malloc(OTA_PEEK_LEN);
     if (!s_peek) {

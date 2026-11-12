@@ -1,14 +1,140 @@
 #include "push.h"
 #include "web_handlers.h"
 #include "config.h"
-#include "web_handlers.h"
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <mbedtls/md.h>
 #include <base64.h>
 #include <sys/time.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
-// 发送邮件通知函数（带重试）
+// ============================================================
+// 通知队列 + 后台任务
+// ------------------------------------------------------------
+// 以前「一条短信进来」→ 5 个推送通道各最多 3 次重试 → 再发 SMTP（也 3 次），
+// 全部串在 loop() 里跑，最坏能把主循环按住几十秒。这期间 WebServer 不响应，
+// modemPump 也不被调用，串口 2KB 缓冲一满就丢短信。
+// 现在 loop() 只把「要通知谁、通知什么」塞进队列（4 个槽位，纯内存操作），
+// 真正发 HTTP / SMTP 的是独立 FreeRTOS 任务。ESP32-C3 是单核，但任务在等
+// socket/信号量时会主动让出 CPU，主循环照常转。
+// ============================================================
+#define NOTIFY_Q_LEN 4
+
+struct NotifyJob {
+  bool   doPush;
+  bool   doEmail;
+  String sender, text, ts;    // 推送用
+  String subject, body;       // 邮件用
+};
+
+static NotifyJob         s_nq[NOTIFY_Q_LEN];
+static int               s_nqHead = 0, s_nqTail = 0, s_nqCnt = 0;
+static SemaphoreHandle_t s_nqMux  = NULL;   // 保护队列
+static SemaphoreHandle_t s_netMux = NULL;   // 串行化「发网络请求」：任务和测试按钮不打架
+static TaskHandle_t      s_notifyTask = NULL;
+static volatile bool     s_notifyDropped = false;
+
+static void notifyWorker(void* arg);
+
+void notifyInit() {
+  if (s_nqMux == NULL) s_nqMux = xSemaphoreCreateMutex();
+  if (s_netMux == NULL) s_netMux = xSemaphoreCreateRecursiveMutex();
+  if (s_notifyTask == NULL) {
+    // 9KB 栈：和以前在主循环里跑的是同一套 HTTPClient / SMTP+TLS 调用，够用
+    xTaskCreate(notifyWorker, "notify", 9216, NULL, 1, &s_notifyTask);
+  }
+}
+
+static bool notifyEnqueue(const NotifyJob& j) {
+  if (s_nqMux == NULL) return false;
+  if (xSemaphoreTake(s_nqMux, pdMS_TO_TICKS(300)) != pdTRUE) return false;
+  if (s_nqCnt >= NOTIFY_Q_LEN) {
+    // 队列满说明通知发得比短信来得慢，丢最早一条（新的更值得发）
+    s_nqHead = (s_nqHead + 1) % NOTIFY_Q_LEN;
+    s_nqCnt--;
+    s_notifyDropped = true;
+  }
+  s_nq[s_nqTail] = j;
+  s_nqTail = (s_nqTail + 1) % NOTIFY_Q_LEN;
+  s_nqCnt++;
+  xSemaphoreGive(s_nqMux);
+  return true;
+}
+
+static bool notifyDequeue(NotifyJob& out) {
+  bool got = false;
+  if (s_nqMux && xSemaphoreTake(s_nqMux, pdMS_TO_TICKS(200)) == pdTRUE) {
+    if (s_nqCnt > 0) {
+      out = s_nq[s_nqHead];
+      s_nq[s_nqHead] = NotifyJob();   // 释放字符串
+      s_nqHead = (s_nqHead + 1) % NOTIFY_Q_LEN;
+      s_nqCnt--;
+      got = true;
+    }
+    xSemaphoreGive(s_nqMux);
+  }
+  return got;
+}
+
+static void runEmailSync(const char* subject, const char* body);
+static void pushAllChannels(const char* sender, const char* message, const char* timestamp);
+
+static void notifyWorker(void* arg) {
+  NotifyJob j;
+  for (;;) {
+    if (!notifyDequeue(j)) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+    if (s_netMux) xSemaphoreTakeRecursive(s_netMux, portMAX_DELAY);
+    if (j.doPush)  pushAllChannels(j.sender.c_str(), j.text.c_str(), j.ts.c_str());
+    if (j.doEmail) runEmailSync(j.subject.c_str(), j.body.c_str());
+    if (s_netMux) xSemaphoreGiveRecursive(s_netMux);
+    vTaskDelay(pdMS_TO_TICKS(30));
+  }
+}
+
+// 邮件：入队后立即返回
 void sendEmailNotification(const char* subject, const char* body) {
+  NotifyJob j;
+  j.doPush = false;
+  j.doEmail = true;
+  j.subject = subject ? subject : "";
+  j.body = body ? body : "";
+  if (!notifyEnqueue(j)) logCaptureLn(String("[邮件] 通知队列忙，这条邮件丢弃"));
+}
+
+// 短信通知：推送 + 邮件一起入队
+void notifySms(const char* sender, const char* message, const char* timestamp,
+               const char* emailSubject, const char* emailBody) {
+  NotifyJob j;
+  j.doPush = true;
+  j.doEmail = true;
+  j.sender = sender ? sender : "";
+  j.text = message ? message : "";
+  j.ts = timestamp ? timestamp : "";
+  j.subject = emailSubject ? emailSubject : "";
+  j.body = emailBody ? emailBody : "";
+  if (!notifyEnqueue(j)) logCaptureLn(String("[通知] 队列忙，这条通知丢弃"));
+}
+
+bool notifyQueueBusy() { return s_nqCnt > 0; }
+int  notifyQueueDepth() { return s_nqCnt; }
+bool notifyHadDrop() { bool d = s_notifyDropped; s_notifyDropped = false; return d; }
+
+// TLS 策略：配置了根证书就真校验，没配就明说「不校验」，不再静悄悄地裸奔
+void applyTlsPolicy(WiFiClientSecure& c) {
+  if (config.tlsCaCert.length() > 20) {
+    c.setCACert(config.tlsCaCert.c_str());
+  } else {
+    c.setInsecure();
+  }
+}
+
+// 发邮件（带重试）——真正干活的同步版本，只允许 notifyWorker 或「测试按钮」调用
+static void runEmailSync(const char* subject, const char* body) {
   if (config.smtpServer.length() == 0 || config.smtpUser.length() == 0 || 
       config.smtpPass.length() == 0 || config.smtpSendTo.length() == 0) {
     logCaptureLn(String("邮件配置不完整，跳过发送"));
@@ -33,6 +159,7 @@ void sendEmailNotification(const char* subject, const char* body) {
 
     // 清理上一次尝试的残留连接状态，确保每次从干净状态开始
     smtp.stop();
+    applyTlsPolicy(ssl_client);   // 每次连接前按当前配置决定「校验/不校验」
 
     if (!smtp.connect(config.smtpServer.c_str(), config.smtpPort, statusCallback)) {
       logCaptureLn(String("邮件服务器连接失败"));
@@ -183,8 +310,19 @@ static bool executeChannelRequest(const PushChannel& channel, const String& url,
       logCaptureF("[%s] 重试 (%d/%d)...\n", channelName.c_str(), attempt, MAX_ATTEMPTS);
     }
 
+    // https 必须走真正的 TLS 客户端。以前一律 http.begin(url)，
+    // HTTPClient 自己 new 的是明文 WiFiClient，对 443 端口做不了握手，
+    // 于是 Telegram / Server酱 / 任何 https 自定义地址 100% 失败。
+    WiFiClientSecure* sec = nullptr;
     HTTPClient http;
-    http.begin(url);
+    if (url.startsWith("https")) {
+      sec = new WiFiClientSecure();
+      if (!sec) { logCaptureLn(String("[" + channelName + "] 内存不足，跳过")); return false; }
+      applyTlsPolicy(*sec);
+      http.begin(*sec, url);
+    } else {
+      http.begin(url);
+    }
     if (!isGet) http.addHeader("Content-Type", contentType);
     int httpCode = isGet ? http.GET() : http.POST(body);
 
@@ -201,6 +339,7 @@ static bool executeChannelRequest(const PushChannel& channel, const String& url,
         logCaptureF("[%s] 推送成功（第 %d/%d 次尝试）\n", channelName.c_str(), attempt, MAX_ATTEMPTS);
         if (resp.length() > 0) logCaptureLn(String("响应: " + resp));
         http.end();
+        delete sec;
         return true;
       }
 
@@ -210,11 +349,13 @@ static bool executeChannelRequest(const PushChannel& channel, const String& url,
       if (httpCode >= 400 && httpCode < 500 && httpCode != 429) {
         logCaptureF("[%s] 客户端错误 %d，跳过重试\n", channelName.c_str(), httpCode);
         http.end();
+        delete sec;
         return false;
       }
       logCaptureLn(String("[" + channelName + "] 本次推送未确认成功"));
     }
     http.end();
+    delete sec;   // TLS 客户端是按次 new 的，必须成对释放，否则每重试一次漏几 KB
   }
 
   logCaptureLn(String("[" + channelName + "] 多次重试后仍失败"));
@@ -449,8 +590,8 @@ bool sendToChannel(const PushChannel& channel, const char* sender, const char* m
   return executeChannelRequest(channel, reqUrl, useGet, reqContentType, reqBody, channelName);
 }
 
-// 发送短信到所有启用的推送通道
-void sendSMSToServer(const char* sender, const char* message, const char* timestamp) {
+// 发送短信到所有启用的推送通道（同步版本，只在 notifyWorker 里跑）
+static void pushAllChannels(const char* sender, const char* message, const char* timestamp) {
   if (WiFi.status() != WL_CONNECTED) {
     logCaptureLn(String("WiFi未连接，跳过推送"));
     return;
@@ -482,6 +623,15 @@ void sendSMSToServer(const char* sender, const char* message, const char* timest
 // 网页「发送测试消息」：强制按启用状态发送一条测试短信内容，返回真实结果
 bool pushTestChannel(int idx) {
   if (idx < 0 || idx >= MAX_PUSH_CHANNELS) return false;
+  // 后台任务可能正在用同一个 smtp / TLS 连接，必须排队。但只等 3 秒就放弃：
+  // 让网页请求卡住几十秒，比「请稍后再试」的提示更糟。
+  bool locked = false;
+  if (s_netMux) locked = (xSemaphoreTakeRecursive(s_netMux, pdMS_TO_TICKS(3000)) == pdTRUE);
+  if (s_netMux && !locked) {
+    logCaptureLn(String("[测试] 正在发送真实通知，稍后再试"));
+    return false;
+  }
+  struct Rel { SemaphoreHandle_t m; bool on; ~Rel(){ if(m && on) xSemaphoreGiveRecursive(m); } } rel{s_netMux, locked};
   if (WiFi.status() != WL_CONNECTED) {
     logCaptureLn(String("[测试] WiFi 未连接，无法发测试消息"));
     return false;

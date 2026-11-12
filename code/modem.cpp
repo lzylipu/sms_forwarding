@@ -22,6 +22,30 @@ static bool   s_gotPrompt  = false;
 static String s_atBuf;
 static String s_respPrefix;         // 当前命令期望的响应前缀，如 "+CEREG"
 
+// ------------------------------------------------------------
+// 异步发信状态机（实现见文件末尾）
+// ------------------------------------------------------------
+// 旧实现把「等 '>' 提示符 + 等 +CMGS 结果」整个塞在 sendSMS() 里死等，最长 35 秒。
+// 这 35 秒里 loop() 不跑：WebServer 不响应（网页看着像死机）、modemPump 不被调用
+// （新短信只能堆在 2KB 串口缓冲里），看门狗和 OTA 存活检测也停摆。
+// 现在拆成 3 个状态，由 loop() 里的 smsSendTask() 每次推进一小步，主循环始终能转。
+#define SMS_TX_IDLE   0
+#define SMS_TX_PROMPT 1
+#define SMS_TX_RESULT 2
+#define SMS_TX_DRAIN  3   // 发送已判定失败，再吞 3 秒迟到响应，别被下一条 AT 命令当成自己的回复
+
+static int           s_txState = SMS_TX_IDLE;
+static String        s_txPduHex;          // 已编码好的 PDU（十六进制）
+static char          s_txPhone[24] = "";
+static unsigned long s_txDeadline = 0;
+static bool          s_txLastOk = false;
+static String        s_txLastInfo = "";
+static unsigned long s_txSeq = 0;         // 入队序号，网页靠它认领结果
+static unsigned long s_txDoneSeq = 0;     // 已出结果的序号
+static unsigned long s_txDrainUntil = 0;  // DRAIN 状态截止时刻
+
+static void smsTxFinish(bool ok, const String& why);
+
 // 模组侧未读短信索引队列（+CMTI 上报时入队，空闲时取回）
 static int s_pendIdx[8];
 static int s_pendCnt = 0;
@@ -119,6 +143,14 @@ static void handleUrcLine(String line) {
   line.trim();
   if (line.length() == 0) return;
 
+  // ---- 发送失败后的排空窗口：模组可能晚几百毫秒才回 OK / ERROR / +CMGS，
+  //      这些迟到行如果留给下一条 AT 命令，会把下一条命令判成成功或失败 ----
+  if (s_txState == SMS_TX_DRAIN) {
+    if ((long)(millis() - s_txDrainUntil) >= 0) s_txState = SMS_TX_IDLE;
+    else if (!line.startsWith("+CMT") && !line.startsWith("+CDS") &&
+             !line.startsWith("+CMTI") && !line.startsWith("+CEREG")) return;
+  }
+
   // ---- 命令响应优先：正在等的命令，其响应前缀与 URC 同名（如 +CEREG? / +CSQ） ----
   if (s_atActive && s_respPrefix.length() > 0 && line.startsWith(s_respPrefix)) {
     s_atBuf += line + "\n";
@@ -195,6 +227,11 @@ void modemPump() {
 
 // 全工程统一 AT 执行入口：只等响应，不再二次泵 WebServer（消除重入）
 String atExec(const char* cmd, unsigned long timeout, bool* okOut) {
+  // 发信状态机占着 AT 通道时一律不插队：否则两条命令的响应会互相吃掉
+  if (s_txState != SMS_TX_IDLE) {
+    if (okOut) *okOut = false;
+    return "";
+  }
   // 从命令推导期望的响应前缀：AT+CEREG? -> +CEREG，AT+CMGS=14 -> +CMGS
   s_respPrefix = "";
   String c(cmd);
@@ -581,6 +618,18 @@ void modemInit() {
   if (need_set_CGACT) {
     if (retryAt("AT+CGACT=0,1", 5000, 5, "设置CGACT")) {
       logCaptureLn(String("已禁用数据连接(AT+CGACT=0,1)，防止流量消耗"));
+  // 短信中心号码：发不出去时第一个要看的参数。留个日志，省得每次翻 AT 手册。
+  {
+    String csca = atExec("AT+CSCA?", 1500, nullptr);
+    int p = csca.indexOf("+CSCA:");
+    if (p >= 0) {
+      String line = csca.substring(p, csca.indexOf('\n', p) < 0 ? csca.length() : csca.indexOf('\n', p));
+      line.trim();
+      logCaptureLn(String("[模组] 短信中心 ") + line.substring(6));
+    } else {
+      logCaptureLn(String("[模组] ⚠️ 读不到短信中心号码（AT+CSCA? 无应答），发短信会失败"));
+    }
+  }
     }
   } else {
     logCaptureLn(String("该型号无法配置(AT+CGACT=0,1)，跳过该命令"));
@@ -633,58 +682,127 @@ bool waitCEREG() {
   return (stat == 1 || stat == 5);
 }
 
-// 发送短信（PDU模式）
-bool sendSMS(const char* phoneNumber, const char* message) {
+// ------------------------------------------------------------
+// 异步发信状态机（状态变量定义在文件开头）
+// ------------------------------------------------------------
+bool smsTxBusy() { return s_txState == SMS_TX_PROMPT || s_txState == SMS_TX_RESULT; }
+int  smsTxState() { return s_txState; }
+unsigned long smsTxSeq() { return s_txSeq; }
+unsigned long smsTxDoneSeq() { return s_txDoneSeq; }
+bool smsTxLastOk() { return s_txLastOk; }
+String smsTxLastInfo() { return s_txLastInfo; }
+
+// 编码并入队，立即返回。真正的串口交互交给 smsSendTask()
+bool smsQueueSend(const char* phoneNumber, const char* message) {
   if (!modemReady) {
     logCaptureLn(String("模组未就绪，拒绝发送"));
     return false;
   }
-  logCaptureLn(String("准备发送短信..."));
-  logCapture(String("目标号码: ")); logCaptureLn(String(phoneNumber));
+  if (s_txState != SMS_TX_IDLE) {
+    logCaptureLn(String("上一条短信还在发送中，请稍后再试"));
+    return false;
+  }
 
   pdu.setSCAnumber();  // 使用默认短信中心
   int pduLen = pdu.encodePDU(phoneNumber, message);
   if (pduLen < 0) {
-    logCapture(String("PDU编码失败，错误码: "));
-    logCaptureLn(String(pduLen));
+    logCaptureF("PDU编码失败，错误码: %d\n", pduLen);
     return false;
   }
-  logCapture(String("PDU长度: ")); logCaptureLn(String(pduLen));
+  s_txPduHex = String(pdu.getSMS());
+  strncpy(s_txPhone, phoneNumber, sizeof(s_txPhone) - 1);
+  s_txPhone[sizeof(s_txPhone) - 1] = '\0';
+  s_txSeq++;
 
-  String cmgsCmd = "AT+CMGS=" + String(pduLen);
-
-  // 阶段一二：等 '>' 提示符
   s_atBuf = ""; s_atDone = false; s_atOk = false;
-  s_atActive = true; s_waitPrompt = true; s_gotPrompt = false;
-  Serial1.print(cmgsCmd);
+  s_respPrefix = "+CMGS";
+  s_atActive = true;
+  s_waitPrompt = true; s_gotPrompt = false;
+  s_txState = SMS_TX_PROMPT;
+  s_txDeadline = millis() + 5000;
+
+  logCaptureF("准备发送短信 -> %s（PDU %d 字节，请求号 %lu）\n", s_txPhone, pduLen, s_txSeq);
+  Serial1.print("AT+CMGS=" + String(pduLen));
   Serial1.print("\r\n");
+  return true;
+}
 
-  unsigned long start = millis();
-  while (!s_gotPrompt && (millis() - start) < 5000) {
-    modemPump();
-    delay(1);
-  }
-  s_waitPrompt = false;
+// loop() 调用：推进发信状态机，每次只做一步
+void smsSendTask() {
+  if (s_txState == SMS_TX_IDLE) return;
 
-  if (!s_gotPrompt) {
-    s_atActive = false;
-    logCaptureLn(String("未收到>提示符"));
-    return false;
+  if (s_txState == SMS_TX_DRAIN) {
+    if ((long)(millis() - s_txDrainUntil) >= 0) s_txState = SMS_TX_IDLE;
+    return;
   }
 
-  // 阶段三：发 PDU + Ctrl-Z
-  Serial1.print(pdu.getSMS());
-  Serial1.write(0x1A);
-
-  start = millis();
-  while (!s_atDone && (millis() - start) < 30000) {
-    modemPump();
-    delay(1);
+  if (s_txState == SMS_TX_PROMPT) {
+    if (s_gotPrompt) {
+      s_waitPrompt = false; s_gotPrompt = false;
+      Serial1.print(s_txPduHex);
+      Serial1.write(0x1A);
+      s_txPduHex = "";            // 立刻释放，别占着堆等 30 秒
+      s_txState = SMS_TX_RESULT;
+      s_txDeadline = millis() + 30000;
+      return;
+    }
+    if ((long)(millis() - s_txDeadline) >= 0) smsTxFinish(false, "未收到 > 提示符");
+    return;
   }
-  s_atActive = false;
 
-  bool ok = s_atOk;
+  // SMS_TX_RESULT
+  if (s_atDone) {
+    String why = s_atBuf;
+    why.trim();
+    smsTxFinish(s_atOk, s_atOk ? String("OK") : why);
+    return;
+  }
+  if ((long)(millis() - s_txDeadline) >= 0) smsTxFinish(false, "等待 +CMGS 超时");
+}
+
+// 把 +CMS ERROR 翻成人话：用户看到「网络超时」就知道该查话费，而不是来问固件
+static String smsErrText(const String& raw) {
+  int p = raw.indexOf("+CMS ERROR:");
+  if (p < 0) return raw;
+  int code = raw.substring(p + 11).toInt();
+  switch (code) {
+    case 300: return "模组内部故障（300）";
+    case 301: return "模组不支持发短信（301）";
+    case 302: return "操作不允许（302）";
+    case 304: return "PDU 参数无效（304）";
+    case 305: return "参数无效（305）";
+    case 310: return "SIM 卡未插入（310）";
+    case 311: return "需要输入 SIM 卡 PIN（311）";
+    case 313: return "SIM 卡故障（313）";
+    case 314: return "SIM 卡忙（314）";
+    case 315: return "SIM 卡错误（315）";
+    case 320: return "内存故障（320）";
+    case 321: return "短信索引无效（321）";
+    case 322: return "存储已满（322）";
+    case 330: return "短信中心号码未知，检查 AT+CSCA（330）";
+    case 331: return "无网络服务（331）";
+    case 332: return "网络超时（332）：消息已交给运营商但没收到回执，通常是停机欠费、运营商限流或信号问题";
+    default:  return "运营商/网络拒绝（+" + String(code) + "）";
+  }
+}
+
+static void smsTxFinish(bool ok, const String& why) {
+  int wasState = s_txState;
+  s_atActive = false; s_waitPrompt = false; s_gotPrompt = false;
+  s_txPduHex = "";
+  if (ok) {
+    s_txState = SMS_TX_IDLE;
+  } else {
+    // 还停在等提示符这一步，说明 AT+CMGS 已经发出去了：必须发 ESC 让模组退出
+    // 「等短信正文」模式，否则下一条 AT 指令会被当成短信内容吞掉。
+    if (wasState == SMS_TX_PROMPT) Serial1.write(0x1B);
+    s_txState = SMS_TX_DRAIN;
+    s_txDrainUntil = millis() + 3000;
+  }
+  s_txLastOk = ok;
+  String info = ok ? why : smsErrText(why);
+  s_txLastInfo = info.length() > 160 ? info.substring(0, 160) : info;
+  s_txDoneSeq = s_txSeq;
   if (ok) logCaptureLn(String("短信发送成功"));
-  else logCaptureLn(String("短信发送失败: ") + s_atBuf);
-  return ok;
+  else    logCaptureLn(String("短信发送失败: ") + s_txLastInfo);
 }

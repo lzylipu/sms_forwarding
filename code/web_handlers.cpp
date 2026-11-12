@@ -9,6 +9,8 @@
 #include "ota.h"
 #include <LittleFS.h>
 #include <esp_system.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 // ---- 日志环形缓冲区 ----
 String logBuffer[LOG_BUF_SIZE];
@@ -33,15 +35,36 @@ static void _logCommit() {
 // 那样 _logLine 会无限涨到撑爆堆。超过 512 字节就强制提交。
 #define LOG_LINE_MAX 512
 
+// 日志互斥：通知搬进后台任务之后，日志会被「主循环」和「通知任务」同时写。
+// 两个任务同时 String += 会直接把堆写坏（表现为莫名重启），所以统一加锁。
+static SemaphoreHandle_t s_logMux = NULL;
+
+void logInit() {
+  if (s_logMux == NULL) s_logMux = xSemaphoreCreateRecursiveMutex();
+}
+
+static inline bool logLock() {
+  if (s_logMux == NULL) return false;
+  return xSemaphoreTakeRecursive(s_logMux, portMAX_DELAY) == pdTRUE;
+}
+static inline void logUnlock() {
+  if (s_logMux) xSemaphoreGiveRecursive(s_logMux);
+}
+
 void logCapture(const String& msg) {
   Serial.print(msg);
+  logLock();
   _logLine += msg;
   if (_logLine.length() > LOG_LINE_MAX) _logCommit();
+  logUnlock();
 }
 
 void logCapture(const char* msg) {
   Serial.print(msg);
+  logLock();
   _logLine += msg;
+  if (_logLine.length() > LOG_LINE_MAX) _logCommit();
+  logUnlock();
 }
 
 void logCaptureF(const char* fmt, ...) {
@@ -53,25 +76,33 @@ void logCaptureF(const char* fmt, ...) {
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
   Serial.print(buf);
+  logLock();
   _logLine += buf;
   // 如果格式化字符串以 \n 结尾，则提交此行
   size_t len = strlen(buf);
   if (len > 0 && buf[len - 1] == '\n') {
     _logLine.trim();  // 去掉尾部空格和可能多余的 \n
     _logCommit();
+  } else if (_logLine.length() > LOG_LINE_MAX) {
+    _logCommit();
   }
+  logUnlock();
 }
 
 void logCaptureLn(const String& msg) {
   Serial.println(msg);
+  logLock();
   _logLine += msg;
   _logCommit();
+  logUnlock();
 }
 
 void logCaptureLn(const char* msg) {
   Serial.println(msg);
+  logLock();
   _logLine += msg;
   _logCommit();
+  logUnlock();
 }
 
 // ---------------------------------------------------------------- 会话认证
@@ -122,6 +153,9 @@ static bool sessionValid() {
 // 给上传回调用的静默判断：不发响应，只回答「这个请求有没有有效会话」
 bool authSessionValid() { return sessionValid(); }
 
+// 供页面渲染 %CSRF%：就是当前会话 token，内联到 HTML 里
+String authCsrfToken() { return cookieValue("sid"); }
+
 void authSessionInvalidateAll() {
   for (int i = 0; i < SESSION_SLOTS; i++) { s_sessTok[i] = ""; s_sessStart[i] = 0; }
 }
@@ -139,8 +173,32 @@ static void sessionCreate() {
   server.sendHeader("Set-Cookie", "sid=" + t + "; Path=/; Max-Age=604800; HttpOnly; SameSite=Lax");
 }
 
+// CSRF：双提交校验。会话 token 本身既在 HttpOnly Cookie 里，也内联进页面，
+// 跨站页面读不到页面内容（同源策略），所以伪造请求带不出这个头。
+bool authCsrfValid() {
+  String sid = cookieValue("sid");
+  if (sid.length() != 32) return false;
+  String got = server.header("X-CSRF-Token");
+  if (got.length() == 0) got = server.arg("_csrf");
+  return got.length() == 32 && got == sid;
+}
+
+// 登录/首次配网本身就是「建立信任」的动作，不可能带 CSRF
+static bool csrfExempt(const String& uri) {
+  return uri == "/login" || uri == "/provision" || uri == "/provision/save";
+}
+
 bool checkAuth() {
-  if (sessionValid()) return true;
+  if (sessionValid()) {
+    if (server.method() == HTTP_POST && !csrfExempt(server.uri()) && !authCsrfValid()) {
+      logCaptureLn(String("[Web] 写操作缺少有效 CSRF 令牌，已拒绝: ") + server.uri());
+      server.sendHeader("Cache-Control", "no-store");
+      server.send(403, "application/json",
+                  "{\"success\":false,\"needLogin\":true,\"message\":\"会话令牌已失效，请刷新页面后重试\"}");
+      return false;
+    }
+    return true;
+  }
 
   // 页面导航（Accept 含 text/html）跳登录页；接口一律回 JSON，前端好处理
   String accept = server.header("Accept");
@@ -275,7 +333,7 @@ static const char* PH_KEYS[] = {
   "%IP%", "%WIFI_SSID%", "%FREE_HEAP%", "%UPTIME%", "%WEB_USER%", "%WEB_PASS%",
   "%SMTP_SERVER%", "%SMTP_PORT%", "%SMTP_USER%", "%SMTP_PASS%", "%SMTP_SEND_TO%",
   "%ADMIN_PHONE%", "%NUMBER_BLACK_LIST%", "%INBOX_COUNT%", "%INBOX_UNREAD%",
-  "%MODEM_CHECK%", "%SMTP_CHECK%", "%PUSH_COUNT%", "%PUSH_CHANNELS%"
+  "%MODEM_CHECK%", "%SMTP_CHECK%", "%PUSH_COUNT%", "%PUSH_CHANNELS%", "%CSRF%", "%TLS_CA%", "%TLS_CA_STATE%"
 };
 static const int PH_COUNT = sizeof(PH_KEYS) / sizeof(PH_KEYS[0]);
 
@@ -292,6 +350,12 @@ void handleRoot() {
   if (!checkAuth()) return;
 
   String vals[PH_COUNT];
+  vals[19] = authCsrfToken();
+  vals[20] = htmlEscape(config.tlsCaCert);
+  vals[21] = config.tlsCaCert.length() > 20
+             ? String("已配置根证书：HTTPS 推送与 SMTP 会校验证书链")
+             : String("未配置根证书：HTTPS 推送与 SMTP 只加密、不校验证书（可被中间人冒充）。"
+                      "需要严格校验时把 CA 的 PEM 粘到这里。");
   vals[0]  = WiFi.localIP().toString();
   vals[1]  = String(WiFi.SSID());
   vals[2]  = String(ESP.getFreeHeap() / 1024) + " KB";
@@ -873,15 +937,19 @@ void handleSendSms() {
     logCaptureLn(String("网页端发送短信请求"));
     logCaptureLn(String("目标号码: " + phone));
     logCaptureLn(String("短信内容: " + content));
-    
-    success = sendSMS(phone.c_str(), content.c_str());
-    resultMsg = success ? "短信发送成功！" : "短信发送失败，请检查模组状态";
+
+    // 只入队，不等运营商回执：真实结果由前端轮询 /status 的 tx 字段拿到
+    success = smsQueueSend(phone.c_str(), content.c_str());
+    resultMsg = success ? "已提交给模组，正在发送" : "提交失败（模组未就绪或有短信正在发送）";
   }
 
   // 新界面用 fetch 调用，直接回 JSON；旧书签/无 ajax 的请求保留跳转页
   if (server.hasArg("ajax")) {
     String json = "{\"success\":";
     json += success ? "true" : "false";
+    json += ",\"queued\":";
+    json += success ? "true" : "false";
+    json += ",\"seq\":" + String(smsTxSeq());
     json += ",\"message\":\"" + jsonEscape(resultMsg) + "\"}";
     server.send(200, "application/json", json);
     return;
@@ -926,6 +994,20 @@ void handlePushTest() {
   }
   int idx = server.arg("ch").toInt();
   logCaptureF("[Web] 测试推送通道 %d\n", idx + 1);
+
+  // async=1：走通知队列，和真实短信同一条路径。结果看日志，网页不等。
+  // 用于验证后台任务本身（同步模式只能证明通道配置对）。
+  if (server.hasArg("async")) {
+    if (idx < 0 || idx >= MAX_PUSH_CHANNELS) {
+      server.send(200, "application/json", "{\"success\":false,\"message\":\"通道号超出范围\"}");
+      return;
+    }
+    notifySms("10086", "这是一条测试消息：经由后台通知任务发送。", "测试消息",
+              "通知任务自检", "这条消息用来验证后台通知任务是否正常工作。");
+    server.send(200, "application/json", "{\"success\":true,\"queued\":true,\"message\":\"已交给后台任务，结果见日志\"}");
+    return;
+  }
+
   bool ok = pushTestChannel(idx);
   String msg = ok ? "推送成功，去手机上确认" : "推送失败，看下面的日志说明（常见：Token 错、平台额度用完、设备没网）";
   server.send(200, "application/json",
@@ -1047,6 +1129,13 @@ void handleSave() {
   }
   if (server.hasArg("numberBlackList")) {
     config.numberBlackList = server.arg("numberBlackList");
+  }
+  // TLS 根证书（PEM，可留空）。留空 = 只加密不校验证书，页面会明确提示。
+  if (server.hasArg("tlsCaCert")) {
+    String ca = server.arg("tlsCaCert");
+    ca.replace("\r", "");
+    ca.trim();
+    config.tlsCaCert = ca;
   }
 
   // 推送通道配置：只在对应通道的字段存在时更新
@@ -1509,6 +1598,14 @@ void handleStatus() {
   j += "\"unread\":" + String(inboxUnread()) + ",";
   j += "\"modemUsed\":" + String(inboxModemUsed()) + ",";
   j += "\"modemTotal\":" + String(inboxModemTotal());
+  j += "},";
+  j += "\"tx\":{";
+  j += "\"busy\":" + String(smsTxBusy() ? "true" : "false") + ",";
+  j += "\"state\":" + String(smsTxState()) + ",";
+  j += "\"seq\":" + String(smsTxSeq()) + ",";
+  j += "\"doneSeq\":" + String(smsTxDoneSeq()) + ",";
+  j += "\"lastOk\":" + String(smsTxLastOk() ? "true" : "false") + ",";
+  j += "\"lastInfo\":\"" + jsonEscape(smsTxLastInfo()) + "\"";
   j += "},";
   j += "\"config\":{";
   j += "\"valid\":" + String(configValid ? "true" : "false") + ",";

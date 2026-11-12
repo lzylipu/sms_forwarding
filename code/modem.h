@@ -23,6 +23,14 @@ void modemInit();
 bool sendATandWaitOK(const char* cmd, unsigned long timeout);
 bool waitCEREG();
 void blink_short(unsigned long gap_time = 500);
-bool sendSMS(const char* phoneNumber, const char* message);
+// 异步发信：smsQueueSend 编码入队后立即返回，smsSendTask 在 loop() 里推进
+bool smsQueueSend(const char* phoneNumber, const char* message);
+void smsSendTask();
+bool smsTxBusy();
+int  smsTxState();                 // 0=空闲 1=等提示符 2=等结果
+unsigned long smsTxSeq();          // 已入队请求号
+unsigned long smsTxDoneSeq();      // 已出结果的请求号
+bool smsTxLastOk();                // 最近一次是否成功
+String smsTxLastInfo();            // 最近一次结果描述
 
 #endif

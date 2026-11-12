@@ -16,6 +16,7 @@ void setup() {
   Serial.begin(115200);
   // 缩短初始化延时，WiFi连接会处理自己的超时
   delay(200);
+  logInit();   // 先建日志锁：后面的通知任务会和主循环一起写日志
   otaInit();   // 最早期：统计启动次数，必要时回滚到旧固件
   Serial1.setRxBufferSize(SERIAL_BUFFER_SIZE);  // 必须在 begin 之前，否则仍是默认 256
   Serial1.begin(115200, SERIAL_8N1, RXD, TXD);
@@ -76,8 +77,8 @@ void setup() {
   // WebServer 默认不保存任何请求头（_headerKeysCount = 0），
   // 不显式 collect 的话 server.header("Cookie") 永远是空串 —— 会话 cookie 读不到，
   // 表现就是「登录成功但不跳转」，因为下一次请求又被判成未登录。Accept 同理。
-  static const char* COLLECT[] = { "Cookie", "Accept" };
-  server.collectHeaders(COLLECT, 2);
+  static const char* COLLECT[] = { "Cookie", "Accept", "X-CSRF-Token" };
+  server.collectHeaders(COLLECT, 3);
   server.begin();
   logCaptureLn(String("HTTP服务器已启动"));
 
@@ -104,7 +105,8 @@ void setup() {
     logCaptureLn(String("AP 配网模式，跳过 NTP（模组时间可用）"));
   }
 
-  ssl_client.setInsecure();
+  // TLS 策略不在这里定死：每次连接前 applyTlsPolicy() 按配置决定校验与否
+  notifyInit();   // 通知后台任务（推送 / SMTP 都在这里跑，不占主循环）
   digitalWrite(LED_BUILTIN, LOW);
 
   // ---- 启动通知（网页已可用，发邮件不会影响用户访问） ----
@@ -135,6 +137,7 @@ void loop() {
   checkConcatTimeout();
   if (Serial.available()) Serial1.write(Serial.read());  // 本地串口透传调试
   modemTask();        // 唯一串口读者：URC + AT 响应 + 待取短信
+  smsSendTask();      // 发信状态机：每次推进一小步，绝不在这里等 35 秒
   modemStorageTask(); // 模组存储满了就慢慢清，避免拒收
   modemStatusTask();  // 每 3 秒轮一条状态指令，缓存给网页
   modemRecoveryTask();// 初始化失败时每 2 分钟自动重试，不用人点重启

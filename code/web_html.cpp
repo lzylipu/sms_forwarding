@@ -5,6 +5,7 @@ const char* htmlPage = R"rawliteral(<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="csrf" content="%CSRF%">
 <title>短信转发器</title>
 <link rel="icon" href="data:,">
 <style>
@@ -295,7 +296,12 @@ input[type=file]:hover{border-color:var(--accent)}
           <div class="field"><label>账号</label><input name="smtpUser" value="%SMTP_USER%" placeholder="you@qq.com" autocomplete="off"></div>
           <div class="field"><label>授权码</label><input name="smtpPass" type="password" value="" placeholder="留空表示不修改" autocomplete="new-password"></div>
         </div>
-        <div class="field" style="margin-bottom:0"><label>接收邮箱</label><input name="smtpSendTo" value="%SMTP_SEND_TO%" placeholder="to@example.com"></div>
+        <div class="field"><label>接收邮箱</label><input name="smtpSendTo" value="%SMTP_SEND_TO%" placeholder="to@example.com"></div>
+        <div class="field" style="margin-bottom:0">
+          <label>TLS 根证书（PEM，可选）</label>
+          <textarea name="tlsCaCert" rows="4" style="font-family:monospace;font-size:11.5px" placeholder="把 CA 的 PEM 全文粘贴到这里（从 -----BEGIN CERTIFICATE----- 到 -----END CERTIFICATE-----）；留空则不校验证书">%TLS_CA%</textarea>
+          <p class="hint" id="tlsHint" style="margin:8px 0 0">%TLS_CA_STATE%</p>
+        </div>
       </div>
       <div class="btnrow">
         <button class="primary" type="submit">保存邮件配置</button>
@@ -502,7 +508,18 @@ function res(id,cls,html,keep){
     setTimeout(function(){e.className='result';e.innerHTML='';e.style.opacity='1';},380);
   },5000);
 }
-function api(u,o){return fetch(u,o).then(function(r){if(r.status===401){location.href='/login';throw new Error('login');}return r;});}
+var CSRF=(document.querySelector('meta[name=csrf]')||{}).content||'';
+function api(u,o){
+  o=o||{};
+  if(o.method&&o.method.toUpperCase()!=='GET'){
+    o.headers=Object.assign({},o.headers||{},{'X-CSRF-Token':CSRF});
+  }
+  return fetch(u,o).then(function(r){
+    if(r.status===401){location.href='/login';throw new Error('login');}
+    if(r.status===403){throw new Error('csrf');}
+    return r;
+  });
+}
 function getJSON(u){return api(u).then(function(r){return r.json()});}
 
 var TITLES={home:1,inbox:1,push:1,email:1,admin:1,net:1,wifi:1,modem:1,log:1,fw:1,account:1};
@@ -580,12 +597,25 @@ function sendSms(){
   var p=$('smPhone').value.trim(),c=$('smCnt').value;
   if(!p){toast('请填号码','bad');return;}
   if(!c.trim()){toast('请填内容','bad');return;}
-  var b=$('smBtn');b.disabled=true;res('smResult','info','发送中，最长约 40 秒…');
+  var b=$('smBtn');b.disabled=true;res('smResult','info','已提交，等待运营商回执…',true);
   var body=new URLSearchParams();body.append('phone',p);body.append('content',c);body.append('ajax','1');
   api('/sendsms',{method:'POST',body:body}).then(function(r){return r.json()}).then(function(d){
-    b.disabled=false;
-    if(d.success){res('smResult','ok','已提交给运营商');toast('发送成功','ok');$('smCnt').value='';}
-    else{res('smResult','bad',esc(d.message||'发送失败'));toast('发送失败','bad');}
+    if(!d.success){b.disabled=false;res('smResult','bad',esc(d.message||'提交失败'));toast('提交失败','bad');return;}
+    // 服务端已入队，结果由 /status 的 tx 字段回报（页面不再被 40 秒的请求吊住）
+    var seq=d.seq,n=0;
+    var iv=setInterval(function(){
+      n++;
+      getJSON('/status').then(function(st){
+        var tx=st.tx||{};
+        if(!tx.busy&&tx.doneSeq>=seq){
+          clearInterval(iv);b.disabled=false;
+          if(tx.lastOk){res('smResult','ok','发送成功');toast('发送成功','ok');$('smCnt').value='';}
+          else{res('smResult','bad',esc(tx.lastInfo||'发送失败'));toast('发送失败','bad');}
+        }else if(n>40){
+          clearInterval(iv);b.disabled=false;res('smResult','bad','等待回执超时，去「日志」页看详情');
+        }
+      }).catch(function(){});
+    },1200);
   }).catch(function(){b.disabled=false;res('smResult','bad','请求失败');});
 }
 function loadRecent(){
@@ -707,7 +737,7 @@ function uploadFw(){
   if(!f){toast('请选择 .bin 固件','bad');return;}
   var fd=new FormData();fd.append('firmware',f,f.name);
   var b=$('fwBtn');b.disabled=true;res('fwResult','info','上传中 '+fmtK(f.size)+'，请勿断电…');
-  var x=new XMLHttpRequest();x.open('POST','/api/ota?size='+f.size);
+  var x=new XMLHttpRequest();x.open('POST','/api/ota?size='+f.size);x.setRequestHeader('X-CSRF-Token',CSRF);
   x.onload=function(){
     b.disabled=false;var d=null;try{d=JSON.parse(x.responseText)}catch(e){}
     if(d&&d.success){res('fwResult','ok',esc(d.message));toast('升级完成','ok');waitBack();}

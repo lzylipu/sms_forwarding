@@ -6,7 +6,7 @@
 ![status](https://img.shields.io/badge/status-active-success)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 ![platform](https://img.shields.io/badge/platform-ESP32--C3-red)
-![firmware](https://img.shields.io/badge/firmware-2.1.5-brightgreen)
+![firmware](https://img.shields.io/badge/firmware-2.1.6-brightgreen)
 ![ui](https://img.shields.io/badge/UI-glassmorphism-4299e1)
 
 **[中文](#-简介--overview) · [English](README_EN.md)**
@@ -37,11 +37,14 @@ No Arduino IDE required — flash it from the browser, then upgrade by uploading
 - 🔄 **双系统槽 OTA** — 网页上传 `.bin` 即升级（整包与纯应用镜像自动识别），保留 WiFi / 推送 / 邮件 / 收件箱；连续 3 次启动失败自动回滚
 - 📶 **真配网流程** — 首刷后设备是空配置，开无密码热点并启动强制门户（captive portal），手机连上自动弹配网页
 - 🧠 **短信不丢** — 单串口调度器（URC 与 AT 响应不抢缓冲区）、长短信合并、模组存储自动归档清空
+- ⚡ **主循环不卡** — 推送与邮件在独立后台任务里发，发短信是状态机；慢网络也不会让网页转圈或丢短信
 - 🗂️ **本地收件箱** — LittleFS 存 300 条，支持分页、搜索、已读标记、删除
 - 🔀 **10 种推送方式** — 5 个通道可同时启用，字段随类型自动切换，每个通道带「发送测试消息」
 - 📮 **邮件转发** — SMTP（ReadyMail），支持 SSL/STARTTLS
 - 🖥️ **玻璃拟态控制台** — 首页聚合全部状态 + 快捷操作 + 直接发短信，其余功能独立分页；深浅双主题，手机端自适应
-- 🔐 **页面登录** — Cookie 会话（HttpOnly，7 天），不再弹浏览器原生认证框
+- 🔐 **页面登录** — Cookie 会话（HttpOnly，7 天）+ CSRF 双提交校验，不再弹浏览器原生认证框
+- 🛡️ **可选证书校验** — 填了 TLS 根证书就真校验证书链（SMTP / HTTPS 推送），不填也会在页面上写明风险
+- 📩 **远程管理** — 管理员号码发 `STATUS` / `WIFI` / `LOG` / `SMS:` / `RESET` / `HELP`，结果邮件回执
 - 🧪 **网络自测** — 模组侧 `AT+MPING` 实测连通性，默认 `223.5.5.5`，可自定义目标与次数
 - 🛠️ **CI 出包** — GitHub Actions 锁定版本编译，打 tag 自动发 Release
 
@@ -163,12 +166,25 @@ arduino-cli compile --fqbn esp32:esp32:makergo_c3_supermini \
 
 **邮件**：支持 SMTP + SSL/STARTTLS，四个字段（服务器 / 端口 / 账号 / 授权码）+ 收件地址配齐后自动启用，配置不全自动跳过并写日志。
 
+**TLS 证书校验（可选）**：「邮件通知」页底部有个「TLS 根证书（PEM）」框，SMTP 与 HTTPS 推送共用：
+
+- 留空 → 只加密、不校验证书。适合家用局域网，页面会明确写出这个风险。
+- 粘贴 CA 的 PEM → 走 `setCACert()` 真正校验证书链，防中间人。
+
+> 想让 https 推送严格可信就把证书填上；只关心能不能收到消息的话留空即可。
+
 **管理员远程指令**（从已登记的管理员号码发短信给本机）：
 
 | 指令 | 作用 |
 |---|---|
 | `SMS:号码:内容` | 让设备替你发一条短信 |
+| `STATUS` | 运行状态摘要（在线时长、内存、信号、收件箱） |
+| `WIFI` | 当前 WiFi 与 IP |
+| `LOG` | 最近 20 条设备日志 |
 | `RESET` | 重启设备 |
+| `HELP` | 列出全部指令 |
+
+所有指令的执行结果都**通过邮件回执**，不回复短信（避免扣费）。所以远程管理依赖 SMTP 配好。
 
 ---
 
@@ -233,7 +249,7 @@ sms_forwarding/
 
 ```bash
 # 本地出包（产物是单个 .bin，0x0 整片可刷，也能直接给设备 OTA）
-bash scripts/package.sh out 2.1.5 dist
+bash scripts/package.sh out 2.1.6 dist
 ```
 
 CI（`.github/workflows/build.yml`）：
@@ -258,16 +274,21 @@ CI（`.github/workflows/build.yml`）：
 | 微信收不到 PushPlus | 正确填写的是 Token（不是 Topic），渠道填 `wechat` |
 | 模组温度显示「不支持」 | 该型号无温度传感器，属正常 |
 | 升级后配置丢了 | 只有「整片刷写」（0x0 写入）会清 NVS。用网页「固件升级」上传 `.bin` 不会丢 |
+| 发短信提示「网络超时（332）」 | 运营商层面没给回执，最常见是**号码欠费停机**或运营商限流，不是固件问题。给 SIM 充值后立刻恢复；可对照「首页 → 模组短信存储」上方日志里的 `[模组] 短信中心` 是否读到 |
+| 写操作返回 403「会话令牌已失效」 | 2.1.6 的 CSRF 保护：页面停留太久或手工用 curl。刷新页面重试；脚本调用要带 `X-CSRF-Token`（值等于 `sid`） |
+| 网页点保存没反应、后台日志报「通知队列忙」 | 有短信正在推送/发邮件，等几秒再试。连续积压超过 4 条会丢最早一条，日志有记录 |
 
 ---
 
 ## 🗺️ 路线图 / Roadmap
 
-- [ ] 推送 / 邮件改为异步队列，不再阻塞主循环
-- [ ] 主动发短信改异步，避免最长 35 秒阻塞
-- [ ] 接口加 CSRF token，HTTPS 校验证书
-- [ ] 日志缓冲区加上限
-- [ ] 管理员远程指令扩展（`STATUS` / `WIFI` / `PUSH`）
+- [x] 推送 / 邮件改为异步队列，不再阻塞主循环（2.1.6）
+- [x] 主动发短信改异步状态机（2.1.6）
+- [x] 接口加 CSRF token，HTTPS 可选证书校验（2.1.6）
+- [x] 日志缓冲区加上限（2.1.5）
+- [x] 管理员远程指令扩展（2.1.6）
+- [ ] WebSocket 替代 3 秒轮询
+- [ ] 呼吸灯/蜂鸣器表示未读状态
 
 ---
 
