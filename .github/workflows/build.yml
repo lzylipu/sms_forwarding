@@ -21,8 +21,6 @@ env:
 
 jobs:
   build:
-    # 同步 docs/fw 的提交带 [fw-sync] 标记，避免自己触发自己（否则每次构建产物变一次又提交一次）
-    if: ${{ !contains(github.event.head_commit.message, '[fw-sync]') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write   # 打 tag 时创建 Release 需要写权限
@@ -92,54 +90,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          # 只发一个 .bin：整片刷 = 在线刷写页，设备里 OTA 也用同一个文件
+          # 只发一个 .bin：0x0 整片直刷，设备里的 OTA 也用同一个文件
           files: dist/sms_forwarding.bin
           generate_release_notes: true
-
-  # GitHub Release 的下载链接不带 CORS 头，浏览器里 esp-web-tools 直接 fetch 会被拦
-  # （页面上就是 "Failed to download manifest"）。所以清单和 bin 同步一份到 Pages 的 docs/fw/。
-  pages-fw:
-    if: startsWith(github.ref, 'refs/tags/') && !contains(github.event.head_commit.message, '[fw-sync]')
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    env:
-      BRANCH: main
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.BRANCH }}
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: firmware-${{ needs.build.outputs.version }}
-          path: dist
-
-      - name: Sync to Pages
-        run: |
-          set -euo pipefail
-          OWNER="${GITHUB_REPOSITORY%%/*}"
-          NAME="${GITHUB_REPOSITORY#*/}"
-          VER="${{ needs.build.outputs.version }}"
-          [ -f dist/sms_forwarding.bin ] || { echo "缺少 dist/sms_forwarding.bin"; exit 1; }
-          mkdir -p docs/fw
-          rm -f docs/fw/*.bin docs/fw/SHA256SUMS.txt
-          cp dist/sms_forwarding.bin docs/fw/
-          # 在线刷写页要的清单：只有一个 part，指向上面的 bin
-          printf '{\n  "name": "短信转发器 (ESP32-C3 + ML307R)",\n  "version": "%s",\n  "builds": [\n    {\n      "chipFamily": "ESP32-C3",\n      "parts": [\n        { "path": "https://%s.github.io/%s/fw/sms_forwarding.bin", "offset": 0 }\n      ]\n    }\n  ]\n}\n' "$VER" "$OWNER" "$NAME" > docs/fw/manifest.json
-          ( cd docs/fw && sha256sum *.bin > SHA256SUMS.txt )
-          ls -l docs/fw; cat docs/fw/manifest.json
-
-      - name: Commit and push
-        run: |
-          set -euo pipefail
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/fw
-          if git diff --cached --quiet; then
-            echo "docs/fw 无变化，跳过提交"
-            exit 0
-          fi
-          git commit -m "chore(fw): 同步 ${{ needs.build.outputs.version }} 到在线刷写目录 [fw-sync]"
-          git push origin HEAD:${{ env.BRANCH }}

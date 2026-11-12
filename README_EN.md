@@ -19,13 +19,13 @@
 
 Under $5 of hardware: an ESP32-C3 runs the web console and WiFi, an ML307R-DC module holds the SIM and receives SMS. Every incoming message is forwarded to WeChat (PushPlus / ServerChan / WeCom bot), email, Bark, Feishu, DingTalk or any HTTP endpoint, and archived in a local inbox on LittleFS.
 
-No Arduino IDE required — flash it from the browser with ESP Web Tools, then upgrade by uploading a single `.bin` in the device's own web UI. Configuration and inbox survive upgrades; a firmware that fails to boot 3 times rolls back automatically.
+No Arduino IDE required — download the **single `.bin`** from Releases and write it at `0x0` with one `esptool` command, then upgrade later by uploading the same `.bin` in the device's own web UI. Configuration and inbox survive upgrades; a firmware that fails to boot 3 times rolls back automatically.
 
 ---
 
 ## ✨ Features
 
-- 📲 **Browser flashing** — ESP Web Tools on GitHub Pages, one click in Chrome / Edge; the whole firmware is a **single `.bin`**
+- 📲 **No IDE needed** — the whole firmware is a **single `.bin`** written at `0x0`, bootloader and partition table included; no extra files to download
 - 🔄 **Dual-slot OTA** — upload `.bin` from the web UI, keeps WiFi / push / SMTP / inbox; automatic rollback after 3 failed boots
 - 📶 **Real provisioning** — after flashing the device is empty: it opens an open hotspot with a captive portal, the phone auto-pops the setup page
 - 🧠 **No lost SMS** — single serial scheduler (URCs never race AT responses), multi-part SMS reassembly, modem storage auto-archived and drained
@@ -74,20 +74,20 @@ The ESP32 is powered and flashed over USB. The module keeps its factory AT firmw
 
 ### 3️⃣ Flash
 
-**Option A — Browser (no software needed)**
-
-1. Open <https://lzylipu.github.io/sms_forwarding/>
-2. Click "Connect device and install" in Chrome / Edge, pick the serial port
-3. Fully written in about 1–2 minutes, the device reboots by itself
-
-**Option B — CLI**
+**Option A — Command line (recommended)**
 
 ```bash
-# Download sms_forwarding.bin from Releases, then:
-esptool --chip esp32c3 -p /dev/ttyACM0 write-flash 0x0 sms_forwarding.bin
+# 1. Download sms_forwarding.bin from Releases
+#    https://github.com/lzylipu/sms_forwarding/releases/latest
+# 2. Write the whole image in one shot (COM4 on Windows, /dev/ttyACM0 on Linux/macOS)
+esptool --chip esp32c3 -p /dev/ttyACM0 -b 460800 write-flash 0x0 sms_forwarding.bin
 ```
 
-**Option C — Arduino CLI (build it yourself)**
+`sms_forwarding.bin` is a **whole-package** image: bootloader, partition table and application. Flash it at `0x0` and you are done — no separate files.
+
+> 💡 A first flash overwrites everything on the device. Later upgrades go through "Firmware" in the web UI with the same `.bin`: only the app slot is rewritten, configuration and inbox are kept.
+
+**Option B — Arduino CLI (build it yourself)**
 
 ```bash
 arduino-cli core install esp32:esp32@3.3.10
@@ -226,11 +226,9 @@ sms_forwarding/
 │   └── partitions.csv       # dual app slot layout
 ├── scripts/package.sh       # build output → single sms_forwarding.bin
 ├── docs/
-│   ├── index.html           # browser flasher (GitHub Pages)
 │   ├── ARCHITECTURE.md      # architecture notes
 │   ├── API.md               # HTTP API reference
-│   ├── REVIEW.md            # code review report (defects, evidence, known limits)
-│   └── fw/                  # firmware + manifest served to the flasher
+│   └── REVIEW.md            # code review report (defects, evidence, known limits)
 ├── assets/                  # documentation screenshots
 └── .github/workflows/build.yml
 ```
@@ -248,7 +246,7 @@ CI (`.github/workflows/build.yml`):
 
 - pinned `esp32:esp32@3.3.10` / `pdulib@0.5.11` / `ReadyMail@0.4.2`
 - every push compiles and uploads `sms_forwarding.bin` as an artifact
-- a `v*` tag creates a Release (that single file) and syncs `docs/fw/` for the browser flasher
+- a `v*` tag creates a Release with **that single `.bin`** — download it and write it at `0x0`
 
 ---
 
@@ -256,8 +254,8 @@ CI (`.github/workflows/build.yml`):
 
 | Symptom | Cause & fix |
 |---|---|
-| Flasher says `Failed to download manifest` | The manifest was blocked by CORS. This project serves manifest and bin from the same Pages directory (`docs/fw/`); reload the page. Do not point it at GitHub Release assets when self-hosting |
-| No serial port in the browser | Use Chrome / Edge (Safari and Firefox lack Web Serial), try a data-capable USB-C cable, install CH340/CP210x drivers |
+| `esptool` says `could not open port` | The port is held by another program: close serial monitors, the Arduino IDE, any other flasher. On Linux make sure your user is in `dialout` |
+| Device keeps rebooting after flashing | Make sure you used the **whole-package** `.bin` from Releases and the offset was `0x0` — writing a bare app image to `0x0` will not boot |
 | Hotspot joins but no setup page pops | Some Android builds do not probe. Open `http://192.168.4.1`, or any http site (the portal DNS redirects it) |
 | WiFi scan finds nothing | 2.4 GHz only; you can also type the SSID manually. Make sure firmware ≥ 2.1.1 |
 | Login succeeds but bounces back to login | Known bug in firmware < 2.1.2 (request headers not collected, cookie unreadable). Upgrade |

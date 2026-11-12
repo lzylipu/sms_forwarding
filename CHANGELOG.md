@@ -36,6 +36,10 @@
 
 - `POST /push/test?ch=N&async=1&raw=1`：按**真实短信格式**发一条预览（标题「短信来自: …」），用来确认手机上的实际观感，又不产生真实短信
 
+### 移除
+
+- **去掉 GitHub 在线刷写页与 GitHub Pages**：浏览器刷写依赖 Web Serial + Pages 同源清单，实际用起来不比一条 `esptool` 命令省事，还多一个对外的公开页面。现在只有一条路：从 Releases 下载 `sms_forwarding.bin`，`0x0` 整片写入。仓库里的 `docs/index.html`、`docs/fw/`（清单 + bin + SHA256SUMS）以及 CI 的 `pages-fw` 任务全部删除，Pages 站点已下线
+
 ### 改进
 
 - `/sendsms` 改为立即返回 `{success, queued, seq}` 并带上请求号；网页提交后轮询 `/status` 的 `tx` 段拿真实结果，不再被 40 秒的请求吊住

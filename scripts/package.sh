@@ -64,21 +64,4 @@ assert d[0x10000:0x10001] == b'\xe9', "0x10000 不是应用镜像，镜像布局
 print("==> 布局自检通过: bootloader@0 / 分区表@0x8000 / app@0x10000")
 PYCHK
 
-# 在线刷写页用的清单（放在 Pages 的 docs/fw/ 下）
-BASE=${BASE_URL:-.}
-cat > "$OUT/manifest.json" <<JSON
-{
-  "name": "短信转发器 (ESP32-C3 + ML307R)",
-  "version": "${VER}",
-  "builds": [
-    {
-      "chipFamily": "ESP32-C3",
-      "parts": [
-        { "path": "${BASE}/sms_forwarding.bin", "offset": 0 }
-      ]
-    }
-  ]
-}
-JSON
-
 echo "==> $OUT/sms_forwarding.bin  版本 $VER  app $SIZE/$APP_MAX 字节 ($((SIZE * 100 / APP_MAX))%)  整包 $OUT_SIZE 字节"

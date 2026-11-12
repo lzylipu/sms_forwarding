@@ -21,7 +21,7 @@
 
 整机成本不到 30 块：ESP32-C3 负责联网和网页控制台，ML307R-DC 负责驻网收短信。设备把收到的短信推到微信（PushPlus / Server酱 / 企业微信机器人）、邮件、Bark、飞书、钉钉或任意 HTTP 接口，同时存一份到本地收件箱。
 
-不需要装 Arduino IDE：浏览器打开在线刷写页点一下就能把固件写进设备；之后的升级在设备网页里上传一个 `.bin` 就行，配置和收件箱都不丢，出问题自动回滚。
+不需要装 Arduino IDE：从 Releases 下载**单个 `.bin`**，一条 `esptool` 命令写到 `0x0` 即可；之后的升级在设备网页里上传同一个 `.bin` 就行，配置和收件箱都不丢，出问题自动回滚。
 
 **English**
 
@@ -33,7 +33,7 @@ No Arduino IDE required — flash it from the browser, then upgrade by uploading
 
 ## ✨ 特性 / Features
 
-- 📲 **免 IDE 刷机** — ESP Web Tools 在线刷写，Chrome / Edge 点一下即可；固件是**单个 `.bin`**
+- 📲 **免 IDE 刷机** — 整机固件是**单个 `.bin`**，`0x0` 一次写完全部分区；不需要 Arduino IDE，也不需要额外下载 bootloader / 分区表
 - 🔄 **双系统槽 OTA** — 网页上传 `.bin` 即升级（整包与纯应用镜像自动识别），保留 WiFi / 推送 / 邮件 / 收件箱；连续 3 次启动失败自动回滚
 - 📶 **真配网流程** — 首刷后设备是空配置，开无密码热点并启动强制门户（captive portal），手机连上自动弹配网页
 - 🧠 **短信不丢** — 单串口调度器（URC 与 AT 响应不抢缓冲区）、长短信合并、模组存储自动归档清空
@@ -82,20 +82,20 @@ ESP32 通过 USB 供电和刷机；模组跑出厂 AT 固件，不用动。
 
 ### 3️⃣ 刷固件 / Flash
 
-**方式 A — 浏览器（推荐，无需装任何软件）**
-
-1. 打开 <https://lzylipu.github.io/sms_forwarding/>
-2. Chrome / Edge 点「连接设备并安装」，选串口
-3. 约 1–2 分钟写完，设备自动重启
-
-**方式 B — 命令行**
+**方式 A — 命令行（推荐）**
 
 ```bash
-# 下载 Releases 里的 sms_forwarding.bin，然后：
-esptool --chip esp32c3 -p COM4 write-flash 0x0 sms_forwarding.bin
+# 1. 从 Releases 下载 sms_forwarding.bin
+#    https://github.com/lzylipu/sms_forwarding/releases/latest
+# 2. 一条命令写完整片（Windows 串口如 COM4，Linux/macOS 如 /dev/ttyACM0）
+esptool --chip esp32c3 -p COM4 -b 460800 write-flash 0x0 sms_forwarding.bin
 ```
 
-**方式 C — Arduino CLI（自行编译）**
+`sms_forwarding.bin` 是**整包**：bootloader、分区表、应用都在里面，从 `0x0` 一次写完，不需要再单独刷其他文件。
+
+> 💡 首次刷写会覆盖设备原有全部内容；之后在设备网页里「固件升级」上传同一个 `.bin`，只写应用槽，配置和收件箱都保留。
+
+**方式 B — Arduino CLI（自行编译）**
 
 ```bash
 arduino-cli core install esp32:esp32@3.3.10
@@ -236,11 +236,9 @@ sms_forwarding/
 │   └── partitions.csv       # 双系统槽分区表
 ├── scripts/package.sh       # 编译产物 → 单个 sms_forwarding.bin
 ├── docs/
-│   ├── index.html           # 在线刷写页（GitHub Pages）
 │   ├── ARCHITECTURE.md      # 架构与模块说明
 │   ├── API.md               # HTTP 接口文档
-│   ├── REVIEW.md            # 代码审查报告（缺陷清单 + 验证证据 + 已知限制）
-│   └── fw/                  # 刷写页用的固件与清单（CI 自动同步）
+│   └── REVIEW.md            # 代码审查报告（缺陷清单 + 验证证据 + 已知限制）
 ├── assets/                  # 文档截图
 └── .github/workflows/build.yml
 ```
@@ -258,7 +256,7 @@ CI（`.github/workflows/build.yml`）：
 
 - 锁定 `esp32:esp32@3.3.10` / `pdulib@0.5.11` / `ReadyMail@0.4.2`
 - 每次 push 编译出 `sms_forwarding.bin` 作为 artifact
-- 打 `v*` tag → 创建 Release（只含这一个文件）+ 同步到 `docs/fw/` 供在线刷写页使用
+- 打 `v*` tag → 创建 Release，**只挂这一个 `.bin`**（下载即可 `0x0` 直刷）
 
 ---
 
@@ -266,8 +264,8 @@ CI（`.github/workflows/build.yml`）：
 
 | 现象 / Issue | 原因与解决 / Cause & Fix |
 |---|---|
-| 打开在线刷写页提示 `Failed to download manifest` | 清单被浏览器 CORS 拦了。本项目把清单和 bin 放在 Pages 同源目录（`docs/fw/`），刷新页面即可；自己部署时别指向 GitHub Release |
-| 浏览器里找不到串口 | 用 Chrome / Edge（Safari、Firefox 不支持 Web Serial）；换一条能传数据的 USB-C 线；装 CH340/CP210x 驱动 |
+| `esptool` 报 `could not open port` | 串口被占用：关掉串口监控 / Arduino IDE / 其他烧录工具；Linux 下确认当前用户在 `dialout` 组 |
+| 刷完不进系统、串口一直重启 | 确认写的是 Releases 里的**整包**并且偏移是 `0x0`；不要只写应用镜像到 `0x0` |
 | 连上热点不弹配网页 | 部分安卓机不主动探测。手动开 `http://192.168.4.1`，或打开任意 http 网址（门户 DNS 会把它指过来） |
 | 扫描不到 WiFi | 只支持 2.4G；也可以直接手输 SSID。若在 AP 模式下扫描不到，先确认固件 ≥ 2.1.1 |
 | 登录成功但页面回到登录页 | 固件 < 2.1.2 的 bug（请求头未采集，Cookie 读不到），升级到最新版 |
